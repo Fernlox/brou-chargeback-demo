@@ -1,0 +1,33 @@
+---
+description: Keep project context/state/stack docs synchronized after tasks
+alwaysApply: true
+---
+
+# Project Docs Sync Rule
+
+At the end of every task, check whether changes require updating:
+- `docs/PROJECT_CONTEXT.md`
+- `docs/PROJECT_STATE.md`
+- `docs/TECHNOLOGY_STACK.md`
+
+## Update triggers
+
+Update docs when any of these changed:
+- Architecture, flow, key ownership, or critical file map.
+- Feature behavior, bugs found/fixed, checks run, or current known issues.
+- Dependencies, framework/runtime versions, services, or required environment variables.
+
+## Required behavior
+
+1. Decide explicitly if each of the 3 docs needs an update.
+2. If any needs update, edit it in the same task before finishing.
+3. Refresh the `Last updated` date in each modified doc.
+4. In final task summary, include one line:
+   - `Docs sync: updated <files>` or
+   - `Docs sync: no update needed (reason)`
+
+## Guardrails
+
+- Keep docs concise and factual (no speculative roadmap text).
+- Do not rewrite unchanged sections.
+- Preserve these docs as the canonical "agent memory" for project context.
