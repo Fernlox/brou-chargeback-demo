@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -32,6 +33,29 @@ RESULT_FIELDS = (
     "card_last4",
     "entry_mode",
 )
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_COUNTRY_LABELS = {
+    "UY": "Uruguay",
+    "US": "Estados Unidos",
+    "AR": "Argentina",
+    "BR": "Brasil",
+    "CL": "Chile",
+    "PY": "Paraguay",
+    "CN": "China",
+}
+_MCC_BUSINESS_TYPE_LABELS = {
+    "5411": "supermercado",
+    "5812": "restaurante o delivery",
+    "5814": "restaurante o delivery",
+    "5815": "servicio digital o streaming",
+    "4899": "servicio digital o suscripcion",
+    "4121": "transporte o movilidad",
+    "4814": "telecomunicaciones",
+    "5942": "ecommerce o retail",
+    "5999": "ecommerce o retail",
+    "5541": "estacion de servicio",
+    "5912": "farmacia",
+}
 
 _GEMINI_CLIENT: genai.Client | None = None
 
@@ -48,6 +72,11 @@ def _coerce_amount(value: Any) -> float:
     if isinstance(value, Decimal):
         return float(value)
     return float(value)
+
+
+def _amounts_match_money_precision(left: float, right: float) -> bool:
+    """Compare amounts using 2-decimal money precision."""
+    return round(left, 2) == round(right, 2)
 
 
 def _get_gemini_client() -> genai.Client:
@@ -82,6 +111,66 @@ def _json_safe_row(row: dict[str, Any]) -> dict[str, Any]:
     return safe_row
 
 
+def _clean_string(value: Any) -> str | None:
+    """Normalize string-like values and return None when empty."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _friendly_country(country_code: str | None) -> str | None:
+    """Map a country code to a user-friendly Spanish label."""
+    if not country_code:
+        return None
+    normalized_code = country_code.strip().upper()
+    if not normalized_code:
+        return None
+    return _COUNTRY_LABELS.get(normalized_code, normalized_code)
+
+
+def _resolve_purchase_channel_label(transaction: dict[str, Any]) -> str | None:
+    """Resolve channel as online or physical for customer-facing copy."""
+    entry_mode = _clean_string(transaction.get("entry_mode"))
+    card_present = transaction.get("card_present")
+
+    if entry_mode == "online" or card_present is False:
+        return "online"
+    if entry_mode in {"chip", "contactless", "manual"} or card_present is True:
+        return "presencial (tarjeta física)"
+    return None
+
+
+def _build_user_friendly_transaction_context(transaction: dict[str, Any]) -> dict[str, Any]:
+    """Build sanitized transaction context for customer confirmation copy."""
+    merchant_name = _clean_string(transaction.get("merchant_name")) or "comercio no identificado"
+    merchant_dba = _clean_string(transaction.get("merchant_dba"))
+    city = _clean_string(transaction.get("merchant_city"))
+    country_label = _friendly_country(_clean_string(transaction.get("merchant_country")))
+
+    location_hint_parts = [part for part in (city, country_label) if part]
+    location_hint = ", ".join(location_hint_parts) if location_hint_parts else None
+
+    mcc = _clean_string(transaction.get("mcc"))
+    business_type = _MCC_BUSINESS_TYPE_LABELS.get(mcc) if mcc else None
+
+    card_last4 = _clean_string(transaction.get("card_last4"))
+    card_used = f"tarjeta terminada en {card_last4}" if card_last4 else None
+
+    return {
+        "id": transaction.get("id"),
+        "transaction_at": transaction.get("transaction_at"),
+        "merchant_name": merchant_name,
+        "merchant_display_name": merchant_dba or merchant_name,
+        "total_amount": transaction.get("total_amount"),
+        "currency": transaction.get("currency"),
+        "location_hint": location_hint,
+        "business_type": business_type,
+        "card_used": card_used,
+        "purchase_channel": _resolve_purchase_channel_label(transaction),
+    }
+
+
 def _query_transactions(
     *,
     user_id: str,
@@ -93,6 +182,13 @@ def _query_transactions(
     merchant_query: str | None,
 ) -> list[dict[str, Any]]:
     """Run a single select over transactions with dynamic filters."""
+    normalized_date_from = date_from
+    normalized_date_to = date_to
+    if isinstance(normalized_date_from, str) and _DATE_ONLY_RE.fullmatch(normalized_date_from.strip()):
+        normalized_date_from = f"{normalized_date_from.strip()}T00:00:00+00:00"
+    if isinstance(normalized_date_to, str) and _DATE_ONLY_RE.fullmatch(normalized_date_to.strip()):
+        normalized_date_to = f"{normalized_date_to.strip()}T23:59:59.999999+00:00"
+
     query = (
         get_supabase()
         .table("transactions")
@@ -100,10 +196,10 @@ def _query_transactions(
         .eq("user_id", user_id)
     )
 
-    if date_from:
-        query = query.gte("transaction_at", date_from)
-    if date_to:
-        query = query.lte("transaction_at", date_to)
+    if normalized_date_from:
+        query = query.gte("transaction_at", normalized_date_from)
+    if normalized_date_to:
+        query = query.lte("transaction_at", normalized_date_to)
     if min_amount is not None:
         query = query.gte("total_amount", min_amount)
     if max_amount is not None:
@@ -212,6 +308,13 @@ def search_transactions(
                 -_parse_transaction_dt(row["transaction_at"]).timestamp(),
             )
         )
+        exact_amount_rows = [
+            row
+            for row in rows
+            if _amounts_match_money_precision(_coerce_amount(row["total_amount"]), float(approximate_amount))
+        ]
+        if exact_amount_rows:
+            rows = exact_amount_rows
     else:
         rows.sort(key=lambda row: _parse_transaction_dt(row["transaction_at"]), reverse=True)
 
@@ -247,10 +350,9 @@ def get_transaction_context(transaction_id: str) -> dict[str, Any]:
         transaction_id: UUID of the confirmed transaction.
 
     Returns:
-        A dictionary containing the full transaction detail, same-merchant
-        history, six-month merchant count, and placeholder fields for
-        nearby/geo/mcc context. If the transaction does not exist, returns
-        `{"error": "transaction_not_found"}`.
+        A dictionary containing sanitized transaction detail and same-merchant
+        history metadata for user confirmation. If the transaction does not
+        exist, returns `{"error": "transaction_not_found"}`.
     """
     if not transaction_id:
         raise ValueError("transaction_id is required.")
@@ -272,6 +374,7 @@ def get_transaction_context(transaction_id: str) -> dict[str, Any]:
     user_id = transaction["user_id"]
     merchant_name = transaction["merchant_name"]
     tx_timestamp = transaction["transaction_at"]
+    user_friendly_transaction = _build_user_friendly_transaction_context(transaction)
 
     history_response = (
         client.table("transactions")
@@ -307,12 +410,9 @@ def get_transaction_context(transaction_id: str) -> dict[str, Any]:
     same_merchant_count_6m = int(count_response.count or 0)
 
     return {
-        "transaction": transaction,
+        "transaction": user_friendly_transaction,
         "same_merchant_history": same_merchant_history,
         "same_merchant_count_6m": same_merchant_count_6m,
-        "nearby_transactions": None,
-        "mcc_human_label": None,
-        "geo_hint": None,
     }
 
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useRef, useState } from "react";
+import { buildBackendCandidates } from "@/lib/backendApi";
 
 type ToolCallStatus = "running" | "done";
 
@@ -36,32 +37,6 @@ type ParsedSseEvent = {
 
 const INITIAL_GREETING = "Hola, soy el asistente de BROU. ¿En qué te puedo ayudar?";
 const STREAM_IDLE_TIMEOUT_MS = 45_000;
-const DEFAULT_BACKEND_URLS = [
-  "http://localhost:8000",
-  "http://127.0.0.1:8000",
-  "http://localhost:8001",
-  "http://127.0.0.1:8001",
-];
-
-function normalizeBackendUrl(url: string): string {
-  return url.replace(/\/+$/, "");
-}
-
-function buildBackendCandidates(preferredUrl?: string): string[] {
-  const candidates = [
-    preferredUrl?.trim() || null,
-    ...DEFAULT_BACKEND_URLS,
-  ].filter((value): value is string => Boolean(value));
-
-  const deduped: string[] = [];
-  for (const candidate of candidates) {
-    const normalized = normalizeBackendUrl(candidate);
-    if (!deduped.includes(normalized)) {
-      deduped.push(normalized);
-    }
-  }
-  return deduped;
-}
 
 function parseSseFrame(frame: string): ParsedSseEvent | null {
   const lines = frame.split(/\r?\n/);

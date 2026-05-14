@@ -24,6 +24,11 @@ except ImportError:  # pragma: no cover - supports running with `uvicorn main:ap
     from agent import reset_session, run_agent_turn
 
 try:
+    from .admin import get_ticket_detail, get_ticket_summary, list_tickets
+except ImportError:  # pragma: no cover - supports running with `uvicorn main:app`
+    from admin import get_ticket_detail, get_ticket_summary, list_tickets
+
+try:
     from .tools import (
         apply_rules_and_summarize,
         cancel_chargeback_request,
@@ -109,6 +114,40 @@ def transactions_sample() -> list[dict[str, Any]]:
     except Exception as exc:
         logger.exception("Failed to fetch sample transactions.")
         raise HTTPException(status_code=500, detail=f"Failed to fetch transactions: {exc}") from exc
+
+
+@app.get("/admin/tickets/summary")
+def admin_tickets_summary() -> dict[str, Any]:
+    """Return aggregate counters for admin panel."""
+    try:
+        return get_ticket_summary()
+    except Exception as exc:
+        logger.exception("Failed to fetch admin ticket summary.")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch ticket summary: {exc}") from exc
+
+
+@app.get("/admin/tickets")
+def admin_tickets_list(limit: int = 100) -> dict[str, Any]:
+    """Return recent chargeback tickets for admin listing."""
+    try:
+        return {"items": list_tickets(limit=limit)}
+    except Exception as exc:
+        logger.exception("Failed to fetch admin ticket list.")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch ticket list: {exc}") from exc
+
+
+@app.get("/admin/tickets/{ticket_id}")
+def admin_ticket_detail(ticket_id: str) -> dict[str, Any]:
+    """Return one ticket with summary, recommendation, and logs."""
+    try:
+        ticket = get_ticket_detail(ticket_id=ticket_id)
+    except Exception as exc:
+        logger.exception("Failed to fetch admin ticket detail.")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch ticket detail: {exc}") from exc
+
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="ticket_not_found")
+    return ticket
 
 
 @app.post("/tools/search_transactions")

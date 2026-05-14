@@ -8,6 +8,7 @@ import inspect
 import asyncio
 import time
 import re
+import logging
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +54,7 @@ except ImportError:  # pragma: no cover - supports running from backend director
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
+logger = logging.getLogger(__name__)
 
 COST_WARNING_TEXT = (
     "IMPORTANTE\n"
@@ -103,6 +105,12 @@ CONTINUE_CHOICES: list[dict[str, str]] = [
     },
 ]
 
+_DATE_EXPR_RE = re.compile(r"\b([0-3]?\d)[/\-]([0-1]?\d)(?:[/\-](\d{2,4}))?\b")
+_NUMBER_EXPR_RE = re.compile(r"\b\d+(?:[.,]\d{1,2})?\b")
+_SELECT_TX_RE = re.compile(
+    r"selecciono la transacci[oó]n\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
 SYSTEM_PROMPT = f"""
 Sos el Asistente de Reclamos de BROU.
 Hablás en español rioplatense (uruguayo), usando "vos", "podés" y tono cordial,
@@ -143,7 +151,9 @@ FLUJO (EN ORDEN):
    - Pedí confirmación explícita de la transacción correcta.
 3) Contexto:
    - Usá get_transaction_context.
-   - Si aplica, mostrá same_merchant_count_6m y same_merchant_history.
+   - Mostrá un resumen claro y no técnico para ayudar a validar la compra
+     (comercio, ubicación, tipo de negocio, tarjeta usada y si fue online o presencial).
+   - No muestres datos técnicos internos (por ejemplo MCC numérico, IP, terminal o IDs técnicos).
 4) Advertencia de costos:
    - Debés mostrar textual este mensaje y esperar confirmación:
    "{COST_WARNING_TEXT}"
@@ -314,6 +324,159 @@ def _normalize_text(text: str) -> str:
     return "".join(
         char for char in unicodedata.normalize("NFKD", lowered) if not unicodedata.combining(char)
     )
+
+
+def _extract_selected_transaction_id(text: str) -> str | None:
+    """Extract selected transaction UUID from quick-reply user text."""
+    normalized = _normalize_text(" ".join(text.strip().split()))
+    match = _SELECT_TX_RE.search(normalized)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _extract_transaction_search_slots(
+    text: str,
+    *,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Extract date/amount/currency hints from user text."""
+    compact = " ".join(text.strip().split())
+    if not compact:
+        return {}
+
+    normalized = _normalize_text(compact)
+    extracted: dict[str, Any] = {}
+    reference_now = now_utc or datetime.now(timezone.utc)
+
+    date_match = _DATE_EXPR_RE.search(compact)
+    if date_match:
+        raw_day, raw_month, raw_year = date_match.groups()
+        try:
+            day = int(raw_day)
+            month = int(raw_month)
+            if raw_year is None:
+                year = reference_now.year
+            else:
+                parsed_year = int(raw_year)
+                year = parsed_year + 2000 if parsed_year < 100 else parsed_year
+            parsed_date = datetime(year, month, day)
+            date_iso = parsed_date.strftime("%Y-%m-%d")
+            extracted["date_from"] = date_iso
+            extracted["date_to"] = date_iso
+        except ValueError:
+            pass
+
+    if re.search(r"\b(?:u\$s|usd|dolares?|dolar)\b", normalized):
+        extracted["currency"] = "USD"
+    elif re.search(r"\b(?:uyu|pesos uruguayos?|pesos?)\b", normalized):
+        extracted["currency"] = "UYU"
+
+    text_without_dates = _DATE_EXPR_RE.sub(" ", compact)
+    number_candidates = _NUMBER_EXPR_RE.findall(text_without_dates)
+    if number_candidates:
+        picked_candidate = number_candidates[-1]
+        for candidate in number_candidates:
+            if "." in candidate or "," in candidate:
+                picked_candidate = candidate
+                break
+        try:
+            amount_value = float(picked_candidate.replace(",", "."))
+            if amount_value > 0:
+                exact_markers = (
+                    "exacto",
+                    "exacta",
+                    "monto exacto",
+                    "monto exacta",
+                )
+                approximate_markers = (
+                    "aprox",
+                    "aproxim",
+                    "unos",
+                    "mas o menos",
+                )
+                is_exact = any(marker in normalized for marker in exact_markers)
+                is_approximate = any(marker in normalized for marker in approximate_markers)
+                extracted["amount_value"] = amount_value
+                extracted["amount_is_approximate"] = not is_exact
+                if is_approximate and not is_exact:
+                    extracted["amount_is_approximate"] = True
+        except ValueError:
+            pass
+
+    return extracted
+
+
+def _merge_transaction_search_slots(state: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    """Merge extracted search slots into mutable session state."""
+    current = state.get("search_slots")
+    if not isinstance(current, dict):
+        current = {}
+    current.update(updates)
+    state["search_slots"] = current
+    return current
+
+
+def _search_slots_have_amount(slots: dict[str, Any]) -> bool:
+    """Return whether slots include an amount hint."""
+    return isinstance(slots.get("amount_value"), (int, float))
+
+
+def _build_search_transactions_args_from_slots(slots: dict[str, Any]) -> dict[str, Any]:
+    """Build search_transactions args using deterministic search slots."""
+    args: dict[str, Any] = {"last_n": 5}
+    date_from = slots.get("date_from")
+    date_to = slots.get("date_to")
+    currency = slots.get("currency")
+    amount_value = slots.get("amount_value")
+    amount_is_approximate = bool(slots.get("amount_is_approximate", True))
+
+    if isinstance(date_from, str) and date_from.strip():
+        args["date_from"] = date_from.strip()
+    if isinstance(date_to, str) and date_to.strip():
+        args["date_to"] = date_to.strip()
+    if isinstance(currency, str) and currency in {"UYU", "USD"}:
+        args["currency"] = currency
+
+    if isinstance(amount_value, (int, float)):
+        numeric_amount = float(amount_value)
+        if amount_is_approximate:
+            args["approximate_amount"] = numeric_amount
+            args["amount_tolerance_pct"] = 20.0
+        else:
+            args["min_amount"] = numeric_amount
+            args["max_amount"] = numeric_amount
+
+    return args
+
+
+def _store_latest_search_candidates(state: dict[str, Any], tool_result: dict[str, Any]) -> list[str]:
+    """Store latest candidate transaction IDs in session state."""
+    candidate_ids: list[str] = []
+    payload = tool_result.get("result")
+    if isinstance(payload, dict):
+        raw_results = payload.get("results")
+        if isinstance(raw_results, list):
+            for row in raw_results:
+                if not isinstance(row, dict):
+                    continue
+                transaction_id = row.get("id")
+                if isinstance(transaction_id, str) and transaction_id.strip():
+                    candidate_ids.append(transaction_id)
+
+    state["candidate_transaction_ids"] = candidate_ids
+    state["last_search_had_results"] = bool(candidate_ids)
+    return candidate_ids
+
+
+def _is_latest_search_candidate(state: dict[str, Any], transaction_id: str | None) -> bool:
+    """Validate transaction ID belongs to latest deterministic search candidate list."""
+    if not isinstance(transaction_id, str) or not transaction_id.strip():
+        return False
+    candidates = state.get("candidate_transaction_ids")
+    if not isinstance(candidates, list):
+        return False
+    return transaction_id in candidates
 
 
 def _classify_chargeback_reason_hint(text: str) -> str:
@@ -603,6 +766,36 @@ def _build_ticket_confirmation_text(tool_result: dict[str, Any]) -> str:
     return f"{message}\nGracias por contactarte."
 
 
+async def _apply_rules_summary_background(ticket_id: str) -> None:
+    """Run ticket summarization off the user-facing critical path."""
+    try:
+        await asyncio.to_thread(apply_rules_and_summarize, ticket_id=ticket_id)
+    except Exception:
+        logger.exception("Background apply_rules_and_summarize failed for ticket_id=%s", ticket_id)
+
+
+def _schedule_rules_summary_from_tool_result(tool_result: dict[str, Any]) -> None:
+    """Schedule async rules summary if tool result includes a valid ticket_id."""
+    payload = tool_result.get("result")
+    if not isinstance(payload, dict):
+        return
+
+    ticket_id = payload.get("ticket_id")
+    if not isinstance(ticket_id, str) or not ticket_id.strip():
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(
+            "Skipping async rules summary for ticket_id=%s because no event loop is running.",
+            ticket_id,
+        )
+        return
+
+    loop.create_task(_apply_rules_summary_background(ticket_id=ticket_id))
+
+
 def _format_transaction_date(transaction_at: str) -> str:
     """Format ISO-like transaction timestamp into DD/MM/YYYY."""
     date_raw = transaction_at[:10]
@@ -617,35 +810,54 @@ def _build_transaction_confirmation_text(tool_result: dict[str, Any]) -> str:
     payload = tool_result.get("result")
     if not isinstance(payload, dict):
         return (
-            "Entendido. ¿Confirmás que querés continuar con el reclamo de este cargo?"
+            "No pude validar esa transacción con la información disponible. "
+            "¿Me compartís un dato más para volver a buscar?"
         )
 
     transaction = payload.get("transaction")
     if not isinstance(transaction, dict):
         return (
-            "Entendido. ¿Confirmás que querés continuar con el reclamo de este cargo?"
+            "No encontré contexto válido para esa transacción. "
+            "¿Me compartís otro dato del cargo para volver a buscar?"
         )
 
     merchant_name = str(transaction.get("merchant_name") or "comercio no identificado").strip()
+    merchant_display_name = str(transaction.get("merchant_display_name") or merchant_name).strip()
     currency = str(transaction.get("currency") or "USD").strip()
     transaction_at = str(transaction.get("transaction_at") or "").strip()
     total_amount = transaction.get("total_amount")
+    location_hint = str(transaction.get("location_hint") or "").strip()
+    business_type = str(transaction.get("business_type") or "").strip()
+    card_used = str(transaction.get("card_used") or "").strip()
+    purchase_channel = str(transaction.get("purchase_channel") or "").strip()
 
     amount_repr = "?"
     if isinstance(total_amount, (int, float)):
         amount_repr = f"{float(total_amount):.2f}"
     date_repr = _format_transaction_date(transaction_at) if transaction_at else "fecha no disponible"
 
-    message = (
+    summary_lines: list[str] = [
         f"Entendido, es el cargo de {currency} {amount_repr} en {merchant_name} "
         f"del {date_repr}."
-    )
+    ]
+    if merchant_display_name and merchant_display_name.lower() != merchant_name.lower():
+        summary_lines.append(f"Figura con el nombre comercial {merchant_display_name}.")
+    if location_hint:
+        summary_lines.append(f"La compra aparece ubicada en {location_hint}.")
+    if business_type:
+        summary_lines.append(f"Parece ser un consumo de tipo {business_type}.")
+    if card_used:
+        summary_lines.append(f"Se realizó con la {card_used}.")
+    if purchase_channel:
+        summary_lines.append(f"Se registró como compra {purchase_channel}.")
+
+    message = "\n".join(summary_lines)
 
     same_merchant_count_6m = payload.get("same_merchant_count_6m")
     has_prior_with_merchant = isinstance(same_merchant_count_6m, int) and same_merchant_count_6m > 0
     if has_prior_with_merchant:
         message = (
-            f"{message}\nAntes de seguir, te comento que veo compras previas en este mismo comercio "
+            f"{message}\nAdemás, veo {same_merchant_count_6m} compra(s) previa(s) en este comercio "
             "durante los últimos 6 meses."
         )
 
@@ -709,6 +921,25 @@ def _execute_tool_call(
         return {"error": f"Unknown tool: {tool_name}"}
 
     if tool_name == "search_transactions":
+        slots = _get_session_state(session_id).get("search_slots")
+        if isinstance(slots, dict):
+            if isinstance(slots.get("date_from"), str):
+                args["date_from"] = slots["date_from"]
+            if isinstance(slots.get("date_to"), str):
+                args["date_to"] = slots["date_to"]
+            if isinstance(slots.get("currency"), str) and slots["currency"] in {"UYU", "USD"}:
+                args["currency"] = slots["currency"]
+            amount_value = slots.get("amount_value")
+            if isinstance(amount_value, (int, float)):
+                if bool(slots.get("amount_is_approximate", True)):
+                    args["approximate_amount"] = float(amount_value)
+                    args["amount_tolerance_pct"] = 20.0
+                    args.pop("min_amount", None)
+                    args.pop("max_amount", None)
+                else:
+                    args["min_amount"] = float(amount_value)
+                    args["max_amount"] = float(amount_value)
+                    args.pop("approximate_amount", None)
         # Step 9 requires showing at most 5 candidates.
         requested_last_n = args.get("last_n", 5)
         try:
@@ -738,9 +969,6 @@ def _execute_tool_call(
     if tool_name in {"create_chargeback_ticket", "cancel_chargeback_request"}:
         args.setdefault("conversation_log", _snapshot_transcript(session_id))
 
-    if tool_name == "get_transaction_context" and args.get("transaction_id"):
-        _get_session_state(session_id)["transaction_id"] = args.get("transaction_id")
-
     args_for_log = {key: value for key, value in args.items() if key != "conversation_log"}
     tool_call_repr = _format_tool_call(tool_name, args_for_log)
     _append_transcript_entry(session_id, "tool", f"CALL {tool_call_repr}")
@@ -748,14 +976,6 @@ def _execute_tool_call(
     try:
         if tool_name == "create_chargeback_ticket":
             ticket_payload = fn(**args)
-            ticket_id = ticket_payload.get("ticket_id")
-            if ticket_id:
-                rules_payload = apply_rules_and_summarize(ticket_id=ticket_id)
-                ticket_payload = {
-                    **ticket_payload,
-                    "agent_summary": rules_payload.get("summary"),
-                    "agent_recommendation": rules_payload.get("recommendation"),
-                }
             if args.get("transaction_id"):
                 _get_session_state(session_id)["transaction_id"] = args.get("transaction_id")
             _append_transcript_entry(
@@ -766,6 +986,12 @@ def _execute_tool_call(
             return {"result": ticket_payload}
 
         tool_payload = fn(**args)
+        if tool_name == "search_transactions":
+            _store_latest_search_candidates(_get_session_state(session_id), {"result": tool_payload})
+        if tool_name == "get_transaction_context":
+            transaction = tool_payload.get("transaction") if isinstance(tool_payload, dict) else None
+            if isinstance(transaction, dict) and isinstance(args.get("transaction_id"), str):
+                _get_session_state(session_id)["transaction_id"] = args.get("transaction_id")
         _append_transcript_entry(
             session_id,
             "tool",
@@ -1045,6 +1271,7 @@ async def run_agent_turn(session_id: str, user_message: str):
             "event": "tool_result",
             "data": {"name": "create_chargeback_ticket", "result": create_ticket_result},
         }
+        _schedule_rules_summary_from_tool_result(create_ticket_result)
 
         final_text = _build_ticket_confirmation_text(create_ticket_result)
         _append_transcript_entry(session_id, "agent", final_text)
@@ -1053,6 +1280,147 @@ async def run_agent_turn(session_id: str, user_message: str):
 
         try:
             trace.update(output={"final_response_text": final_text})
+        except Exception:
+            pass
+        flush_traces()
+        yield {"event": "done", "data": {}}
+        return
+
+    selected_transaction_id = _extract_selected_transaction_id(user_message)
+    if selected_transaction_id:
+        if not _is_latest_search_candidate(state, selected_transaction_id):
+            stale_selection_text = (
+                "No pude validar esa opción con la última búsqueda. "
+                "¿Querés que volvamos a buscar el cargo con fecha y monto?"
+            )
+            _append_transcript_entry(session_id, "agent", stale_selection_text)
+            for chunk in _chunk_text_for_sse(stale_selection_text):
+                yield {"event": "token", "data": {"text": chunk}}
+            try:
+                trace.update(output={"final_response_text": stale_selection_text})
+            except Exception:
+                pass
+            flush_traces()
+            yield {"event": "done", "data": {}}
+            return
+
+        context_args = {"transaction_id": selected_transaction_id}
+        yield {
+            "event": "tool_call",
+            "data": {
+                "name": "get_transaction_context",
+                "args": context_args,
+            },
+        }
+        tool_start = time.perf_counter()
+        context_result = _execute_tool_call(
+            "get_transaction_context",
+            context_args,
+            history,
+            session_id,
+        )
+        tool_latency_ms = (time.perf_counter() - tool_start) * 1000.0
+        log_tool_call(
+            trace_obj=trace,
+            tool_name="get_transaction_context",
+            input_args=context_args,
+            output=context_result,
+            latency_ms=tool_latency_ms,
+        )
+        yield {
+            "event": "tool_result",
+            "data": {"name": "get_transaction_context", "result": context_result},
+        }
+
+        payload = context_result.get("result")
+        transaction = payload.get("transaction") if isinstance(payload, dict) else None
+        if not isinstance(transaction, dict):
+            invalid_context_text = (
+                "No pude recuperar el contexto de esa transacción. "
+                "¿Me compartís otro dato del cargo para volver a buscar?"
+            )
+            state["awaiting_transaction_confirmation"] = False
+            state["awaiting_cost_warning_confirmation"] = False
+            state["awaiting_optional_info"] = False
+            _append_transcript_entry(session_id, "agent", invalid_context_text)
+            for chunk in _chunk_text_for_sse(invalid_context_text):
+                yield {"event": "token", "data": {"text": chunk}}
+            try:
+                trace.update(output={"final_response_text": invalid_context_text})
+            except Exception:
+                pass
+            flush_traces()
+            yield {"event": "done", "data": {}}
+            return
+
+        deterministic_confirmation = _build_transaction_confirmation_text(context_result)
+        state["awaiting_transaction_confirmation"] = True
+        state["awaiting_cost_warning_confirmation"] = False
+        state["awaiting_optional_info"] = False
+        yield {
+            "event": "quick_replies",
+            "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+        }
+        _append_transcript_entry(session_id, "agent", deterministic_confirmation)
+        for chunk in _chunk_text_for_sse(deterministic_confirmation):
+            yield {"event": "token", "data": {"text": chunk}}
+        try:
+            trace.update(output={"final_response_text": deterministic_confirmation})
+        except Exception:
+            pass
+        flush_traces()
+        yield {"event": "done", "data": {}}
+        return
+
+    extracted_slots = _extract_transaction_search_slots(user_message)
+    merged_slots = _merge_transaction_search_slots(state, extracted_slots) if extracted_slots else state.get(
+        "search_slots", {}
+    )
+    has_new_amount_hint = isinstance(extracted_slots.get("amount_value"), (int, float))
+    if has_new_amount_hint and isinstance(merged_slots, dict) and _search_slots_have_amount(merged_slots):
+        search_args = _build_search_transactions_args_from_slots(merged_slots)
+        state["awaiting_transaction_confirmation"] = False
+        state["awaiting_cost_warning_confirmation"] = False
+        state["awaiting_optional_info"] = False
+
+        yield {
+            "event": "tool_call",
+            "data": {
+                "name": "search_transactions",
+                "args": search_args,
+            },
+        }
+        tool_start = time.perf_counter()
+        search_result = _execute_tool_call(
+            "search_transactions",
+            search_args,
+            history,
+            session_id,
+        )
+        tool_latency_ms = (time.perf_counter() - tool_start) * 1000.0
+        log_tool_call(
+            trace_obj=trace,
+            tool_name="search_transactions",
+            input_args=search_args,
+            output=search_result,
+            latency_ms=tool_latency_ms,
+        )
+        yield {
+            "event": "tool_result",
+            "data": {"name": "search_transactions", "result": search_result},
+        }
+        transaction_choices = _build_transaction_quick_replies(search_result)
+        deterministic_search_text = _build_transaction_selection_text(search_result)
+        if transaction_choices:
+            yield {
+                "event": "quick_replies",
+                "data": _build_quick_reply_payload(transaction_choices, "transaction_selection"),
+            }
+        _append_transcript_entry(session_id, "agent", deterministic_search_text)
+        for chunk in _chunk_text_for_sse(deterministic_search_text):
+            yield {"event": "token", "data": {"text": chunk}}
+        try:
+            trace.update(output={"final_response_text": deterministic_search_text})
         except Exception:
             pass
         flush_traces()
@@ -1126,6 +1494,25 @@ async def run_agent_turn(session_id: str, user_message: str):
             tool_name = function_call.name or ""
             args = dict(function_call.args or {})
 
+            if tool_name == "get_transaction_context":
+                transaction_id = args.get("transaction_id")
+                if not _is_latest_search_candidate(state, transaction_id):
+                    blocked_context_result = {"error": "transaction_not_in_latest_candidates"}
+                    yield {"event": "tool_call", "data": {"name": tool_name, "args": args}}
+                    yield {
+                        "event": "tool_result",
+                        "data": {"name": tool_name, "result": blocked_context_result},
+                    }
+                    deterministic_turn_text = (
+                        "Necesito que selecciones una transacción de la última búsqueda para continuar. "
+                        "Si no la ves, pasame otro dato y la busco de nuevo."
+                    )
+                    state["awaiting_transaction_confirmation"] = False
+                    state["awaiting_cost_warning_confirmation"] = False
+                    state["awaiting_optional_info"] = False
+                    end_turn_after_tool_response = True
+                    break
+
             yield {"event": "tool_call", "data": {"name": tool_name, "args": args}}
             tool_start = time.perf_counter()
             tool_result = _execute_tool_call(tool_name, args, history, session_id)
@@ -1141,9 +1528,14 @@ async def run_agent_turn(session_id: str, user_message: str):
                 "event": "tool_result",
                 "data": {"name": tool_name, "result": tool_result},
             }
+            if tool_name == "create_chargeback_ticket":
+                _schedule_rules_summary_from_tool_result(tool_result)
             if tool_name == "search_transactions":
                 transaction_choices = _build_transaction_quick_replies(tool_result)
                 deterministic_turn_text = _build_transaction_selection_text(tool_result)
+                state["awaiting_transaction_confirmation"] = False
+                state["awaiting_cost_warning_confirmation"] = False
+                state["awaiting_optional_info"] = False
                 if transaction_choices:
                     yield {
                         "event": "quick_replies",
@@ -1155,14 +1547,25 @@ async def run_agent_turn(session_id: str, user_message: str):
                 end_turn_after_tool_response = True
                 break
             if tool_name == "get_transaction_context":
-                deterministic_turn_text = _build_transaction_confirmation_text(tool_result)
-                state["awaiting_transaction_confirmation"] = True
-                state["awaiting_cost_warning_confirmation"] = False
-                state["awaiting_optional_info"] = False
-                yield {
-                    "event": "quick_replies",
-                    "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
-                }
+                payload = tool_result.get("result")
+                transaction = payload.get("transaction") if isinstance(payload, dict) else None
+                if isinstance(transaction, dict):
+                    deterministic_turn_text = _build_transaction_confirmation_text(tool_result)
+                    state["awaiting_transaction_confirmation"] = True
+                    state["awaiting_cost_warning_confirmation"] = False
+                    state["awaiting_optional_info"] = False
+                    yield {
+                        "event": "quick_replies",
+                        "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+                    }
+                else:
+                    deterministic_turn_text = (
+                        "No encontré una transacción válida para ese contexto. "
+                        "¿Me compartís otro dato del cargo para volver a buscar?"
+                    )
+                    state["awaiting_transaction_confirmation"] = False
+                    state["awaiting_cost_warning_confirmation"] = False
+                    state["awaiting_optional_info"] = False
                 end_turn_after_tool_response = True
                 break
             tool_response_parts.append(
