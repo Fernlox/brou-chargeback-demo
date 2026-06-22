@@ -24,6 +24,19 @@ except ImportError:  # pragma: no cover - supports running with `uvicorn main:ap
     from agent import reset_session, run_agent_turn
 
 try:
+    from .copy import msg, normalize_language
+except ImportError:  # pragma: no cover - supports running with `uvicorn main:app`
+    import importlib.util
+
+    _copy_spec = importlib.util.spec_from_file_location("backend_copy", Path(__file__).with_name("copy.py"))
+    if _copy_spec is None or _copy_spec.loader is None:  # pragma: no cover - defensive
+        raise RuntimeError("Failed to load backend copy module.")
+    _copy_module = importlib.util.module_from_spec(_copy_spec)
+    _copy_spec.loader.exec_module(_copy_module)
+    msg = _copy_module.msg
+    normalize_language = _copy_module.normalize_language
+
+try:
     from .admin import get_ticket_detail, get_ticket_summary, list_tickets
 except ImportError:  # pragma: no cover - supports running with `uvicorn main:app`
     from admin import get_ticket_detail, get_ticket_summary, list_tickets
@@ -170,7 +183,10 @@ def get_transaction_context_tool(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="transaction_id is required.")
 
     try:
-        return get_transaction_context(transaction_id=transaction_id)
+        return get_transaction_context(
+            transaction_id=transaction_id,
+            language=normalize_language(payload.get("language")),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -209,7 +225,10 @@ def apply_rules_and_summarize_tool(payload: dict[str, Any]) -> dict[str, Any]:
     if not ticket_id:
         raise HTTPException(status_code=400, detail="ticket_id is required.")
     try:
-        return apply_rules_and_summarize(ticket_id=ticket_id)
+        return apply_rules_and_summarize(
+            ticket_id=ticket_id,
+            language=normalize_language(payload.get("language")),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -222,6 +241,7 @@ async def chat_stream(payload: dict[str, Any]) -> EventSourceResponse:
     """Stream one chat turn over SSE."""
     session_id = payload.get("session_id")
     message = payload.get("message")
+    language = normalize_language(payload.get("language"))
     if not isinstance(session_id, str) or not session_id.strip():
         raise HTTPException(status_code=400, detail="session_id is required.")
     if not isinstance(message, str) or not message.strip():
@@ -229,7 +249,11 @@ async def chat_stream(payload: dict[str, Any]) -> EventSourceResponse:
 
     async def event_generator():
         try:
-            async for event in run_agent_turn(session_id=session_id, user_message=message):
+            async for event in run_agent_turn(
+                session_id=session_id,
+                user_message=message,
+                language=language,
+            ):
                 yield {
                     "event": event["event"],
                     "data": json.dumps(event["data"], ensure_ascii=False),
@@ -239,7 +263,7 @@ async def chat_stream(payload: dict[str, Any]) -> EventSourceResponse:
             yield {
                 "event": "token",
                 "data": json.dumps(
-                    {"text": "Ocurrió un error interno al procesar el turno."},
+                    {"text": msg(language, "internal_error_turn")},
                     ensure_ascii=False,
                 ),
             }
@@ -261,8 +285,9 @@ async def chat_stream(payload: dict[str, Any]) -> EventSourceResponse:
 async def chat_reset(payload: dict[str, Any]) -> dict[str, Any]:
     """Reset in-memory chat history for a session."""
     session_id = payload.get("session_id")
+    language = normalize_language(payload.get("language"))
     if not isinstance(session_id, str) or not session_id.strip():
         raise HTTPException(status_code=400, detail="session_id is required.")
 
     reset_session(session_id)
-    return {"status": "ok", "session_id": session_id}
+    return {"status": "ok", "session_id": session_id, "language": language}

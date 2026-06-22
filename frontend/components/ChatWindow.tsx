@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { buildBackendCandidates } from "@/lib/backendApi";
+import { useLang } from "@/lib/i18n";
 
 type ToolCallStatus = "running" | "done";
 
@@ -35,7 +36,6 @@ type ParsedSseEvent = {
   data: Record<string, unknown>;
 };
 
-const INITIAL_GREETING = "Hola, soy el asistente de BROU. ¿En qué te puedo ayudar?";
 const STREAM_IDLE_TIMEOUT_MS = 45_000;
 
 function parseSseFrame(frame: string): ParsedSseEvent | null {
@@ -84,8 +84,9 @@ function parseSseFrame(frame: string): ParsedSseEvent | null {
 }
 
 export default function ChatWindow() {
-  const [messages, setMessages] = useState<Message[]>([
-    { id: crypto.randomUUID(), role: "agent", content: INITIAL_GREETING },
+  const { lang, t } = useLang();
+  const [messages, setMessages] = useState<Message[]>(() => [
+    { id: crypto.randomUUID(), role: "agent", content: t("chat.initialGreeting") },
   ]);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -94,10 +95,45 @@ export default function ChatWindow() {
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const activeAgentMessageId = useRef<string | null>(null);
   const activeStreamController = useRef<AbortController | null>(null);
+  const initialLanguageRef = useRef(lang);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, isStreaming]);
+
+  useEffect(() => {
+    if (initialLanguageRef.current === lang) {
+      return;
+    }
+    initialLanguageRef.current = lang;
+    activeStreamController.current?.abort();
+    activeAgentMessageId.current = null;
+    activeStreamController.current = null;
+    setIsStreaming(false);
+    setHasTokenThisTurn(false);
+    setInput("");
+    setMessages([{ id: crypto.randomUUID(), role: "agent", content: t("chat.initialGreeting") }]);
+
+    const backendCandidates = buildBackendCandidates(process.env.NEXT_PUBLIC_BACKEND_URL);
+    void (async () => {
+      for (const backendUrl of backendCandidates) {
+        try {
+          const response = await fetch(`${backendUrl}/chat/reset`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ session_id: sessionId, language: lang }),
+          });
+          if (response.ok) {
+            break;
+          }
+        } catch {
+          // Ignore reset failures and keep local reset.
+        }
+      }
+    })();
+  }, [lang, sessionId, t]);
 
   const appendTokenToAgentMessage = (text: string) => {
     setMessages((prevMessages) => {
@@ -282,7 +318,7 @@ export default function ChatWindow() {
     if (event.event === "quick_replies") {
       const rawChoices = Array.isArray(event.data.choices) ? event.data.choices : [];
       const quickReplies: QuickReply[] = rawChoices
-        .map((choice, index) => {
+        .map((choice, index): QuickReply | null => {
           if (!choice || typeof choice !== "object") {
             return null;
           }
@@ -299,7 +335,7 @@ export default function ChatWindow() {
           const id = typeof maybeChoice.id === "string" ? maybeChoice.id : `quick_reply_${index}`;
           return { id, label, value, displayText };
         })
-        .filter((choice): choice is QuickReply => Boolean(choice));
+        .filter((choice): choice is QuickReply => choice !== null);
 
       setQuickRepliesOnAgentMessage(quickReplies);
       return false;
@@ -360,13 +396,14 @@ export default function ChatWindow() {
             body: JSON.stringify({
               session_id: sessionId,
               message: trimmedInput,
+              language: lang,
             }),
           });
 
           if (!candidateResponse.ok || !candidateResponse.body) {
             const shouldRetry = candidateResponse.status >= 500 || !candidateResponse.body;
             if (!shouldRetry) {
-              throw new Error("No se pudo iniciar el stream.");
+              throw new Error(t("chat.streamStartError"));
             }
             lastFetchError = new Error(
               `Fallback backend ${backendUrl} returned ${candidateResponse.status}.`,
@@ -385,10 +422,14 @@ export default function ChatWindow() {
       }
 
       if (!response) {
-        throw lastFetchError ?? new Error("No se pudo iniciar el stream.");
+        throw lastFetchError ?? new Error(t("chat.streamStartError"));
       }
 
-      const reader = response.body.getReader();
+      const responseBody = response.body;
+      if (!responseBody) {
+        throw new Error(t("chat.streamStartError"));
+      }
+      const reader = responseBody.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let streamDone = false;
@@ -432,8 +473,8 @@ export default function ChatWindow() {
           id: crypto.randomUUID(),
           role: "agent",
           content: wasAborted
-            ? "Se interrumpió la respuesta por demora. Probá enviar de nuevo."
-            : "No pude conectar con el backend en este momento.",
+            ? t("chat.timeoutError")
+            : t("chat.backendError"),
         },
       ]);
     } finally {
@@ -473,15 +514,15 @@ export default function ChatWindow() {
           const hasQuickReplies = Boolean(message.quickReplies && message.quickReplies.length > 0);
           const shouldRenderBubble =
             isUser || hasContent || (!hasToolCalls && !hasQuickReplies) || hasQuickReplies;
-          const fallbackText = hasQuickReplies ? "Elegi una opcion:" : "...";
+          const fallbackText = hasQuickReplies ? t("chat.chooseOption") : "...";
           return (
             <div key={message.id} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
               <div className="max-w-[85%] space-y-2">
                 {!isUser && hasToolCalls ? (
                   <div className="rounded-2xl border border-brou-blue/30 bg-brou-blue/5 p-2">
-                    {message.toolCalls.map((toolCall) => (
+                    {(message.toolCalls ?? []).map((toolCall) => (
                       <div key={toolCall.id} className="rounded-xl px-2 py-1 text-xs text-gray-800">
-                        Uso de herramienta: {toolCall.name}
+                        {t("chat.toolCallPrefix")}: {toolCall.name}
                       </div>
                     ))}
                   </div>
@@ -525,7 +566,7 @@ export default function ChatWindow() {
         {isStreaming && !hasTokenThisTurn && !hasRunningToolCall ? (
           <div className="flex justify-start">
             <div className="rounded-2xl border border-brou-blue bg-white px-4 py-2 text-sm text-gray-500 shadow-sm">
-              escribiendo...
+              {t("chat.typing")}
             </div>
           </div>
         ) : null}
@@ -540,7 +581,7 @@ export default function ChatWindow() {
         <input
           value={input}
           onChange={(event) => setInput(event.target.value)}
-          placeholder="Contame qué pasó..."
+          placeholder={t("chat.placeholder")}
           disabled={isStreaming}
           className="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm text-gray-900 outline-none transition focus:border-brou-blue focus:ring-2 focus:ring-brou-blue/20 disabled:bg-gray-100"
         />
@@ -549,7 +590,7 @@ export default function ChatWindow() {
           disabled={!isStreaming && !input.trim()}
           className="rounded-lg bg-brou-blue px-4 py-2 text-sm font-semibold text-white transition hover:bg-brou-blue-dark disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {isStreaming ? "Detener" : "Enviar"}
+          {isStreaming ? t("chat.stop") : t("chat.send")}
         </button>
       </form>
     </div>

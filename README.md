@@ -120,6 +120,27 @@ npm run dev
 
 Abrir `http://localhost:3000`.
 
+### 4.1 Arranque rápido con scripts (backend + frontend)
+
+Podés levantar todo desde la raíz del repo con:
+
+```bash
+./scripts/run_dev.sh
+```
+
+También podés correr cada servicio por separado:
+
+```bash
+./scripts/run_backend.sh
+./scripts/run_frontend.sh
+```
+
+Variables opcionales:
+- `BACKEND_PORT` (default `8000`)
+- `BACKEND_HOST` (default `127.0.0.1`, solo backend)
+- `FRONTEND_PORT` (default `3000`, solo frontend)
+- `NEXT_PUBLIC_BACKEND_URL` (default `http://localhost:$BACKEND_PORT`, solo frontend)
+
 ### 5. Langfuse (opcional pero recomendado)
 
 Crear un proyecto en https://cloud.langfuse.com, copiar las keys al `.env` y reiniciar el backend.

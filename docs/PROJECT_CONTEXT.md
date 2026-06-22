@@ -1,6 +1,6 @@
 # Project Context (Living Document)
 
-Last updated: 2026-05-14
+Last updated: 2026-06-11
 
 ## What this project is
 
@@ -11,21 +11,22 @@ This is a demo environment with fictional data and one implemented reason flow:
 
 ## High-level architecture
 
-- Frontend (`frontend/`): Next.js App Router UI with a shared shell that toggles between `ChatWindow` and a read-only `AdminPanel`.
-- Backend (`backend/`): FastAPI API + SSE endpoint + Gemini orchestration.
+- Frontend (`frontend/`): Next.js App Router UI with a shared shell that toggles between `ChatWindow` and a read-only `AdminPanel`, plus in-app ES/EN language context (`frontend/lib/i18n.tsx`).
+- Backend (`backend/`): FastAPI API + SSE endpoint + Gemini orchestration with language-aware copy/prompt module (`backend/copy.py`).
 - Data (`supabase/`): SQL migrations and deterministic seed generator.
 - Rules (`rules.md`): business rule source used by runtime summarization.
 
 ## Core runtime flow
 
 1. User sends message from frontend.
-2. Frontend posts to `POST /chat/stream`.
+2. Frontend posts to `POST /chat/stream` with `session_id`, `message`, and selected `language` (`es` or `en`).
 3. Backend `run_agent_turn()` calls Gemini with tool declarations and routing hints.
 4. Agent invokes tools from `backend/tools.py` against Supabase.
 5. After optional additional-info prompt, backend now has a deterministic closure path that creates ticket data directly (instead of relying fully on model function-calling reliability for that last step).
 6. Ticket is created and confirmed to the user immediately; `apply_rules_and_summarize()` now runs asynchronously in background.
 7. SSE events now prioritize tool events (`tool_call` / `tool_result`) before response text when tool calls are present, and include structured `quick_replies`.
 8. Admin panel loads read-only ticket aggregates/list/detail via `GET /admin/tickets/summary`, `GET /admin/tickets`, and `GET /admin/tickets/{ticket_id}`.
+9. Frontend language toggle updates UI labels/placeholders immediately and resets the active chat session before the next turn in the selected language.
 
 ## Conversational routing behavior
 
@@ -57,7 +58,10 @@ This is a demo environment with fictional data and one implemented reason flow:
 - Frontend shell/toggle: `frontend/components/AppShell.tsx`
 - Frontend chat UI: `frontend/components/ChatWindow.tsx`
 - Frontend admin UI: `frontend/components/AdminPanel.tsx`
+- Frontend i18n provider/dictionary: `frontend/lib/i18n.tsx`
 - Frontend backend URL helper: `frontend/lib/backendApi.ts`
+- Backend localized copy/prompt source: `backend/copy.py`
+- Dev launcher scripts: `scripts/run_backend.sh`, `scripts/run_frontend.sh`, `scripts/run_dev.sh`
 - DB schema: `supabase/migrations/*.sql`
 - Seed script: `supabase/seed.py`
 - Rule engine input: `rules.md`

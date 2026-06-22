@@ -72,6 +72,7 @@ def list_tickets(limit: int = 100) -> list[dict[str, Any]]:
                     "id",
                     "ticket_number",
                     "status",
+                    "reason_code",
                     "reason_label_es",
                     "created_at",
                     "updated_at",

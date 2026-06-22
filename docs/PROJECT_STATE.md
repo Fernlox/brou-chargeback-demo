@@ -1,6 +1,6 @@
 # Project State (Living Snapshot)
 
-Last updated: 2026-05-14
+Last updated: 2026-06-11
 Owner: Cursor agent tasks
 
 ## Current delivery status
@@ -13,6 +13,9 @@ Owner: Cursor agent tasks
 - Chat now supports structured quick-reply buttons from backend SSE events.
 - Admin panel now uses a wide 3-column layout in admin mode with clearer Spanish status tags, dedicated conversation panel, and human-readable transaction detail cards.
 - Header now renders the official BROU SVG logo instead of placeholder text.
+- App now supports in-session bilingual ES/EN switching across frontend UI and backend chat agent responses, including language-aware prompts, deterministic copy, and quick-reply labels.
+- Admin ticket reason now localizes from `reason_code` in both ticket list and detail views instead of showing raw `reason_label_es` in English mode.
+- Root-level dev scripts now start backend/frontend together (`./scripts/run_dev.sh`) or separately while wiring frontend to local backend URL.
 
 ## What was checked in this audit
 
@@ -41,6 +44,12 @@ Latest run for this update:
   - `backend`: `backend/.venv/bin/python -m unittest backend/tests/test_tools.py backend/tests/test_agent_guardrails.py` (pass, user-friendly transaction context + confirmation copy)
   - `backend`: `backend/.venv/bin/python -m py_compile backend/tools.py backend/agent.py` (pass)
   - `backend`: `python3 -m py_compile backend/agent.py` (pass, async post-ticket summarization decoupling)
+  - `frontend`: `npm run lint` (pass, ES/EN i18n wiring in AppShell/ChatWindow/AdminPanel)
+  - `frontend`: `npm run build` (pass, production build with i18n changes)
+  - `backend`: `backend/.venv/bin/python -m py_compile backend/agent.py backend/tools.py backend/main.py backend/copy.py` (pass, bilingual backend runtime)
+  - `backend`: `backend/.venv/bin/python -m unittest backend/tests/test_tools.py backend/tests/test_agent_guardrails.py` (pass, guardrails + tool formatting after bilingual update)
+  - `scripts`: `bash -n scripts/run_backend.sh scripts/run_frontend.sh scripts/run_dev.sh` (pass)
+  - `backend`: `backend/.venv/bin/python -c "import uvicorn; import backend.main; print('imports_ok')"` (pass, avoids stdlib `copy` shadowing)
 
 ## Issues found
 
@@ -140,6 +149,21 @@ Latest run for this update:
    - Area: `backend/agent.py`
    - Symptom: final ticket confirmation waited for `apply_rules_and_summarize` (DB reads + Gemini generation + DB update), making "ticket created" feel slow.
    - Fix: removed synchronous summarization from the ticket creation tool path and scheduled `apply_rules_and_summarize` asynchronously after emitting `tool_result`, so users receive ticket number confirmation immediately while internal summary/recommendation persists in background.
+
+20. Website and chat flow were Spanish-only
+   - Area: `frontend/components/AppShell.tsx`, `frontend/components/ChatWindow.tsx`, `frontend/components/AdminPanel.tsx`, `frontend/lib/i18n.tsx`, `backend/copy.py`, `backend/main.py`, `backend/agent.py`, `backend/tools.py`
+   - Symptom: UI labels/placeholders/errors, chat quick replies, deterministic backend guardrail copy, and Gemini system instruction were fixed to Spanish.
+   - Fix: added ES/EN language toggle in header, centralized frontend dictionary/context i18n, threaded `language` through `/chat/stream` + `/chat/reset`, introduced backend localized copy/system-prompt module, made quick-reply values language-stable (`reason:*`, `continue:*`, `tx_select:*`), and added bilingual keyword handling for guardrails/intents.
+
+21. Dev launcher scripts failed on macOS and conflicted with stdlib import resolution
+   - Area: `scripts/run_backend.sh`, `scripts/run_dev.sh`
+   - Symptom: `./scripts/run_dev.sh` could crash with `ImportError` because `uvicorn` imported `backend/copy.py` instead of Python stdlib `copy`, and Bash 3.2 rejected `wait -n`.
+   - Fix: run backend from repo root using `uvicorn backend.main:app` (avoids module shadowing) and replace `wait -n` with a Bash 3-compatible process-monitor loop.
+
+22. Admin reason label stayed in Spanish in English UI mode
+   - Area: `frontend/components/AdminPanel.tsx`, `frontend/lib/i18n.tsx`, `backend/admin.py`
+   - Symptom: in English mode, the admin panel still displayed `Desconocimiento de transacciones` because list/detail views used raw `reason_label_es`.
+   - Fix: include `reason_code` in admin ticket list payload and map reason display to localized labels from i18n dictionaries, with fallback to `reason_label_es` when code is unavailable.
 
 ### Open
 

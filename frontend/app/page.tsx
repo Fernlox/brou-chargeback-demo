@@ -1,5 +1,10 @@
 import AppShell from "@/components/AppShell";
+import { LanguageProvider } from "@/lib/i18n";
 
 export default function Home() {
-  return <AppShell />;
+  return (
+    <LanguageProvider>
+      <AppShell />
+    </LanguageProvider>
+  );
 }

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { fetchBackendJson } from "@/lib/backendApi";
+import { useLang } from "@/lib/i18n";
 
 type TicketSummary = {
   total: number;
@@ -15,6 +16,7 @@ type TicketListItem = {
   id: string;
   ticket_number: string;
   status: string;
+  reason_code?: string;
   reason_label_es: string;
   created_at: string;
   updated_at: string;
@@ -55,13 +57,7 @@ type ConversationMessage = {
   isToolMessage?: boolean;
 };
 
-const STATUS_LABELS: Record<string, string> = {
-  open: "Abierto",
-  cancelled_by_user: "Cancelado por el usuario",
-  in_review: "En revision",
-  resolved_favorable: "Resuelto favorable",
-  resolved_unfavorable: "Resuelto desfavorable",
-};
+type Translator = (key: string, params?: Record<string, string | number>) => string;
 
 const STATUS_BADGE_CLASSES: Record<string, string> = {
   open: "border-sky-200 bg-sky-50 text-sky-700",
@@ -71,7 +67,7 @@ const STATUS_BADGE_CLASSES: Record<string, string> = {
   resolved_unfavorable: "border-rose-200 bg-rose-50 text-rose-700",
 };
 
-function formatDate(value?: string | null): string {
+function formatDate(value?: string | null, locale = "es-UY"): string {
   if (!value) {
     return "-";
   }
@@ -79,26 +75,35 @@ function formatDate(value?: string | null): string {
   if (Number.isNaN(parsed.getTime())) {
     return value;
   }
-  return parsed.toLocaleString("es-UY");
+  return parsed.toLocaleString(locale);
 }
 
-function formatAmount(amount?: number, currency?: string): string {
+function formatAmount(amount?: number, currency?: string, locale = "es-UY"): string {
   if (amount == null || !currency) {
     return "-";
   }
-  return new Intl.NumberFormat("es-UY", {
+  return new Intl.NumberFormat(locale, {
     style: "currency",
     currency,
     maximumFractionDigits: 2,
   }).format(amount);
 }
 
-function getStatusLabel(status: string): string {
-  return STATUS_LABELS[status] ?? status;
+function getStatusLabel(status: string, t: Translator): string {
+  const translated = t(`admin.status.${status}`);
+  return translated === `admin.status.${status}` ? status : translated;
 }
 
 function getStatusBadgeClass(status: string): string {
   return STATUS_BADGE_CLASSES[status] ?? "border-brou-blue/30 bg-brou-blue/5 text-brou-blue";
+}
+
+function getReasonLabel(reasonCode: string | undefined, reasonLabelEs: string, t: Translator): string {
+  if (!reasonCode) {
+    return reasonLabelEs;
+  }
+  const translated = t(`admin.reasonByCode.${reasonCode}`);
+  return translated === `admin.reasonByCode.${reasonCode}` ? reasonLabelEs : translated;
 }
 
 function toRecord(value: unknown): Record<string, unknown> | null {
@@ -138,75 +143,68 @@ function toBooleanValue(value: unknown): boolean | null {
   return null;
 }
 
-function mapCardBrand(value: string | null): string | null {
+function mapCardBrand(value: string | null, t: Translator): string | null {
   if (!value) {
     return null;
   }
-  const labels: Record<string, string> = {
-    visa: "Visa",
-    mastercard: "Mastercard",
-    amex: "American Express",
-  };
-  return labels[value] ?? value.toUpperCase();
+  const translated = t(`admin.cardBrand.${value}`);
+  return translated === `admin.cardBrand.${value}` ? value.toUpperCase() : translated;
 }
 
-function mapEntryMode(value: string | null): string | null {
+function mapEntryMode(value: string | null, t: Translator): string | null {
   if (!value) {
     return null;
   }
-  const labels: Record<string, string> = {
-    chip: "Chip",
-    contactless: "Contactless",
-    manual: "Ingreso manual",
-    online: "En linea",
-  };
-  return labels[value] ?? value;
+  const translated = t(`admin.entryMode.${value}`);
+  return translated === `admin.entryMode.${value}` ? value : translated;
 }
 
-function mapCvm(value: string | null): string | null {
+function mapCvm(value: string | null, t: Translator): string | null {
   if (!value) {
     return null;
   }
-  const labels: Record<string, string> = {
-    pin: "PIN",
-    signature: "Firma",
-    biometric: "Biometria",
-    none: "Sin verificacion",
-  };
-  return labels[value] ?? value;
+  const translated = t(`admin.cvm.${value}`);
+  return translated === `admin.cvm.${value}` ? value : translated;
 }
 
-function mapRole(entry: Record<string, unknown>): { roleLabel: string; bubbleClass: string } {
+function mapRole(entry: Record<string, unknown>, t: Translator): { roleLabel: string; bubbleClass: string } {
   const rawRole = typeof entry.role === "string" ? entry.role.toLowerCase() : "";
   if (rawRole.includes("user") || rawRole.includes("cliente")) {
-    return { roleLabel: "Cliente", bubbleClass: "border-slate-200 bg-white" };
+    return { roleLabel: t("admin.role.customer"), bubbleClass: "border-slate-200 bg-white" };
   }
   if (rawRole.includes("assistant") || rawRole.includes("agent")) {
-    return { roleLabel: "Asistente", bubbleClass: "border-sky-200 bg-sky-50/70" };
+    return { roleLabel: t("admin.role.assistant"), bubbleClass: "border-sky-200 bg-sky-50/70" };
   }
   if (rawRole.includes("tool")) {
-    return { roleLabel: "Herramienta", bubbleClass: "border-indigo-200 bg-indigo-50/70" };
+    return { roleLabel: t("admin.role.tool"), bubbleClass: "border-indigo-200 bg-indigo-50/70" };
   }
-  return { roleLabel: "Sistema", bubbleClass: "border-slate-200 bg-slate-50" };
+  return { roleLabel: t("admin.role.system"), bubbleClass: "border-slate-200 bg-slate-50" };
 }
 
 function buildConversationMessages(
   log?: Array<Record<string, unknown>> | null,
+  t?: Translator,
+  locale?: string,
 ): ConversationMessage[] {
   if (!Array.isArray(log)) {
+    return [];
+  }
+  if (!t) {
     return [];
   }
 
   return log
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
     .map((entry) => {
-      const mappedRole = mapRole(entry);
+      const mappedRole = mapRole(entry, t);
       const rawContent =
         typeof entry.content === "string"
           ? entry.content
           : JSON.stringify(entry.content ?? "", null, 2);
       const content =
-        mappedRole.roleLabel === "Herramienta" ? formatToolConversationContent(rawContent) : rawContent;
+        mappedRole.roleLabel === t("admin.role.tool")
+          ? formatToolConversationContent(rawContent, t, locale)
+          : rawContent;
       const timestamp = typeof entry.ts === "string" ? entry.ts : undefined;
 
       return {
@@ -214,27 +212,21 @@ function buildConversationMessages(
         bubbleClass: mappedRole.bubbleClass,
         content,
         timestamp,
-        isToolMessage: mappedRole.roleLabel === "Herramienta",
+        isToolMessage: mappedRole.roleLabel === t("admin.role.tool"),
       };
     });
 }
 
-function formatToolName(name: string): string {
-  const labels: Record<string, string> = {
-    search_transactions: "Busqueda de transacciones",
-    get_transaction_context: "Contexto de transaccion",
-    create_chargeback_ticket: "Creacion de reclamo",
-    cancel_chargeback_request: "Cancelacion de reclamo",
-    apply_rules_and_summarize: "Analisis y resumen",
-  };
-  return labels[name] ?? name;
+function formatToolName(name: string, t: Translator): string {
+  const translated = t(`admin.toolNames.${name}`);
+  return translated === `admin.toolNames.${name}` ? name : translated;
 }
 
-function summarizeSearchTransactions(payload: Record<string, unknown>): string {
+function summarizeSearchTransactions(payload: Record<string, unknown>, t: Translator, locale: string): string {
   const results = Array.isArray(payload.results) ? payload.results : [];
   const total = typeof payload.total_results === "number" ? payload.total_results : results.length;
   if (total === 0) {
-    return "No se encontraron transacciones con los criterios enviados.";
+    return t("admin.toolSummary.noTransactions");
   }
 
   const topItems = results
@@ -244,54 +236,56 @@ function summarizeSearchTransactions(payload: Record<string, unknown>): string {
         return null;
       }
       const row = item as Record<string, unknown>;
-      const merchant = toTextValue(row.merchant_name) ?? "Comercio";
+      const merchant = toTextValue(row.merchant_name) ?? t("admin.toolSummary.merchantFallback");
       const amount = toNumberValue(row.total_amount);
       const currency = toTextValue(row.currency) ?? "";
-      const date = formatDate(toTextValue(row.transaction_at));
-      const amountLabel = amount != null ? formatAmount(amount, currency || undefined) : currency;
+      const date = formatDate(toTextValue(row.transaction_at), locale);
+      const amountLabel = amount != null ? formatAmount(amount, currency || undefined, locale) : currency;
       return `- ${merchant} (${amountLabel || "-"}) - ${date}`;
     })
     .filter((line): line is string => Boolean(line));
 
   return [
-    `Se encontraron ${total} transacciones.`,
-    topItems.length > 0 ? "Primeros resultados:" : null,
+    t("admin.toolSummary.foundTransactions", { total }),
+    topItems.length > 0 ? t("admin.toolSummary.firstResults") : null,
     ...topItems,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
 }
 
-function summarizeTransactionContext(payload: Record<string, unknown>): string {
+function summarizeTransactionContext(payload: Record<string, unknown>, t: Translator, locale: string): string {
   const transaction = toRecord(payload.transaction);
   if (!transaction) {
-    return "No se pudo recuperar el contexto de la transaccion.";
+    return t("admin.toolSummary.noContext");
   }
 
-  const merchant = toTextValue(transaction.merchant_name) ?? "Comercio";
+  const merchant = toTextValue(transaction.merchant_name) ?? t("admin.toolSummary.merchantFallback");
   const amount = toNumberValue(transaction.total_amount);
   const currency = toTextValue(transaction.currency);
-  const date = formatDate(toTextValue(transaction.transaction_at));
+  const date = formatDate(toTextValue(transaction.transaction_at), locale);
   const sameMerchantCount =
     typeof payload.same_merchant_count_6m === "number" ? payload.same_merchant_count_6m : null;
 
   const summary = [
-    `Transaccion validada: ${merchant}.`,
-    `Monto: ${amount != null ? formatAmount(amount, currency ?? undefined) : "-"}.`,
-    `Fecha: ${date}.`,
+    t("admin.toolSummary.validatedTransaction", { merchant }),
+    t("admin.toolSummary.amount", {
+      amount: amount != null ? formatAmount(amount, currency ?? undefined, locale) : "-",
+    }),
+    t("admin.toolSummary.date", { date }),
   ];
   if (sameMerchantCount != null) {
-    summary.push(`Historial en el mismo comercio (6 meses): ${sameMerchantCount}.`);
+    summary.push(t("admin.toolSummary.sameMerchantHistory", { count: sameMerchantCount }));
   }
   return summary.join("\n");
 }
 
-function summarizeTicketCreation(payload: Record<string, unknown>): string {
+function summarizeTicketCreation(payload: Record<string, unknown>, t: Translator): string {
   const ticketNumber = toTextValue(payload.ticket_number);
   if (!ticketNumber) {
-    return "Se registro el reclamo, pero sin numero de ticket visible.";
+    return t("admin.toolSummary.ticketCreatedNoNumber");
   }
-  return `Reclamo creado correctamente. Numero de ticket: ${ticketNumber}.`;
+  return t("admin.toolSummary.ticketCreatedWithNumber", { ticketNumber });
 }
 
 function parseToolResultPayload(raw: string): { toolName: string; payload: Record<string, unknown> | null } | null {
@@ -324,9 +318,13 @@ function parseToolCallPayload(raw: string): { toolName: string; args: Record<str
   }
 }
 
-function summarizeToolCall(toolName: string, args: Record<string, unknown> | null): string {
+function summarizeToolCall(
+  toolName: string,
+  args: Record<string, unknown> | null,
+  t: Translator,
+): string {
   if (!args) {
-    return `Ejecutando ${formatToolName(toolName)}.`;
+    return t("admin.toolSummary.runningTool", { toolName: formatToolName(toolName, t) });
   }
   if (toolName === "search_transactions") {
     const merchant = toTextValue(args.merchant_query);
@@ -335,58 +333,69 @@ function summarizeToolCall(toolName: string, args: Record<string, unknown> | nul
     const dateTo = toTextValue(args.date_to);
     const amount = toNumberValue(args.approximate_amount ?? args.min_amount);
     return [
-      `Ejecutando ${formatToolName(toolName)}.`,
-      merchant ? `Comercio: ${merchant}.` : null,
-      amount != null ? `Monto de referencia: ${amount}.` : null,
-      dateFrom || dateTo ? `Rango: ${dateFrom ?? "-"} a ${dateTo ?? "-"}.` : null,
-      lastN != null ? `Limite: ${Math.trunc(lastN)} resultados.` : null,
+      t("admin.toolSummary.runningTool", { toolName: formatToolName(toolName, t) }),
+      merchant ? t("admin.toolSummary.merchant", { merchant }) : null,
+      amount != null ? t("admin.toolSummary.amountReference", { amount }) : null,
+      dateFrom || dateTo
+        ? t("admin.toolSummary.range", { from: dateFrom ?? "-", to: dateTo ?? "-" })
+        : null,
+      lastN != null ? t("admin.toolSummary.limit", { limit: Math.trunc(lastN) }) : null,
     ]
       .filter((line): line is string => Boolean(line))
       .join("\n");
   }
-  return `Ejecutando ${formatToolName(toolName)}.`;
+  return t("admin.toolSummary.runningTool", { toolName: formatToolName(toolName, t) });
 }
 
-function summarizeToolResult(toolName: string, payload: Record<string, unknown> | null): string {
+function summarizeToolResult(
+  toolName: string,
+  payload: Record<string, unknown> | null,
+  t: Translator,
+  locale: string,
+): string {
   if (!payload) {
-    return `${formatToolName(toolName)} finalizo sin detalle legible.`;
+    return t("admin.toolSummary.unreadableDetails", { toolName: formatToolName(toolName, t) });
   }
   if (payload.error) {
-    return `${formatToolName(toolName)} devolvio error.`;
+    return t("admin.toolSummary.error", { toolName: formatToolName(toolName, t) });
   }
 
   const result = toRecord(payload.result);
   if (!result) {
-    return `${formatToolName(toolName)} completado.`;
+    return t("admin.toolSummary.completed", { toolName: formatToolName(toolName, t) });
   }
 
   if (toolName === "search_transactions") {
-    return summarizeSearchTransactions(result);
+    return summarizeSearchTransactions(result, t, locale);
   }
   if (toolName === "get_transaction_context") {
-    return summarizeTransactionContext(result);
+    return summarizeTransactionContext(result, t, locale);
   }
   if (toolName === "create_chargeback_ticket" || toolName === "cancel_chargeback_request") {
-    return summarizeTicketCreation(result);
+    return summarizeTicketCreation(result, t);
   }
-  return `${formatToolName(toolName)} completado correctamente.`;
+  return t("admin.toolSummary.completedSuccessfully", { toolName: formatToolName(toolName, t) });
 }
 
-function formatToolConversationContent(rawContent: string): string {
+function formatToolConversationContent(rawContent: string, t: Translator, locale = "es-UY"): string {
   const callPayload = parseToolCallPayload(rawContent);
   if (callPayload) {
-    return summarizeToolCall(callPayload.toolName, callPayload.args);
+    return summarizeToolCall(callPayload.toolName, callPayload.args, t);
   }
 
   const resultPayload = parseToolResultPayload(rawContent);
   if (resultPayload) {
-    return summarizeToolResult(resultPayload.toolName, resultPayload.payload);
+    return summarizeToolResult(resultPayload.toolName, resultPayload.payload, t, locale);
   }
 
-  return "Evento de herramienta procesado.";
+  return t("admin.toolSummary.processedEvent");
 }
 
-function buildTransactionFields(transaction: Record<string, unknown>): Array<{ label: string; value: string }> {
+function buildTransactionFields(
+  transaction: Record<string, unknown>,
+  t: Translator,
+  locale: string,
+): Array<{ label: string; value: string }> {
   const amount = toNumberValue(transaction.total_amount);
   const currency = toTextValue(transaction.currency);
   const merchantCity = toTextValue(transaction.merchant_city);
@@ -398,30 +407,45 @@ function buildTransactionFields(transaction: Record<string, unknown>): Array<{ l
   const fxRate = toNumberValue(transaction.fx_rate);
 
   const fields: Array<{ label: string; value: string | null }> = [
-    { label: "Comercio", value: toTextValue(transaction.merchant_name) },
-    { label: "Nombre comercial", value: toTextValue(transaction.merchant_dba) },
-    { label: "Fecha de transaccion", value: formatDate(toTextValue(transaction.transaction_at)) },
-    { label: "Monto", value: amount != null ? formatAmount(amount, currency ?? undefined) : null },
-    { label: "Moneda", value: currency },
-    { label: "Tarjeta", value: toTextValue(transaction.card_last4) ? `**** ${toTextValue(transaction.card_last4)}` : null },
-    { label: "Marca", value: mapCardBrand(toTextValue(transaction.card_brand)) },
-    { label: "Rubro (MCC)", value: toTextValue(transaction.mcc) },
-    { label: "Ciudad/Pais", value: location || null },
-    { label: "Modo de ingreso", value: mapEntryMode(toTextValue(transaction.entry_mode)) },
-    { label: "Verificacion del titular", value: mapCvm(toTextValue(transaction.cvm)) },
-    { label: "Tarjeta presente", value: cardPresent == null ? null : cardPresent ? "Si" : "No" },
-    { label: "Operacion tokenizada", value: tokenized == null ? null : tokenized ? "Si" : "No" },
+    { label: t("admin.fields.merchant"), value: toTextValue(transaction.merchant_name) },
+    { label: t("admin.fields.merchantDisplayName"), value: toTextValue(transaction.merchant_dba) },
     {
-      label: "Impuesto",
-      value: salesTax != null ? formatAmount(salesTax, currency ?? undefined) : null,
+      label: t("admin.fields.transactionDate"),
+      value: formatDate(toTextValue(transaction.transaction_at), locale),
     },
-    { label: "Tipo de cambio", value: fxRate != null ? fxRate.toFixed(4) : null },
-    { label: "Referencia cliente", value: toTextValue(transaction.customer_reference) },
-    { label: "Numero de factura", value: toTextValue(transaction.invoice_number) },
-    { label: "Codigo postal", value: toTextValue(transaction.merchant_postal_code) },
-    { label: "Terminal", value: toTextValue(transaction.terminal_id) },
-    { label: "IP", value: toTextValue(transaction.ip_address) },
-    { label: "ID de transaccion", value: toTextValue(transaction.id) },
+    {
+      label: t("admin.fields.amount"),
+      value: amount != null ? formatAmount(amount, currency ?? undefined, locale) : null,
+    },
+    { label: t("admin.fields.currency"), value: currency },
+    {
+      label: t("admin.fields.card"),
+      value: toTextValue(transaction.card_last4) ? `**** ${toTextValue(transaction.card_last4)}` : null,
+    },
+    { label: t("admin.fields.brand"), value: mapCardBrand(toTextValue(transaction.card_brand), t) },
+    { label: t("admin.fields.mcc"), value: toTextValue(transaction.mcc) },
+    { label: t("admin.fields.location"), value: location || null },
+    { label: t("admin.fields.entryMode"), value: mapEntryMode(toTextValue(transaction.entry_mode), t) },
+    { label: t("admin.fields.cvm"), value: mapCvm(toTextValue(transaction.cvm), t) },
+    {
+      label: t("admin.fields.cardPresent"),
+      value: cardPresent == null ? null : cardPresent ? t("admin.fields.yes") : t("admin.fields.no"),
+    },
+    {
+      label: t("admin.fields.tokenized"),
+      value: tokenized == null ? null : tokenized ? t("admin.fields.yes") : t("admin.fields.no"),
+    },
+    {
+      label: t("admin.fields.tax"),
+      value: salesTax != null ? formatAmount(salesTax, currency ?? undefined, locale) : null,
+    },
+    { label: t("admin.fields.fxRate"), value: fxRate != null ? fxRate.toFixed(4) : null },
+    { label: t("admin.fields.customerReference"), value: toTextValue(transaction.customer_reference) },
+    { label: t("admin.fields.invoiceNumber"), value: toTextValue(transaction.invoice_number) },
+    { label: t("admin.fields.postalCode"), value: toTextValue(transaction.merchant_postal_code) },
+    { label: t("admin.fields.terminal"), value: toTextValue(transaction.terminal_id) },
+    { label: t("admin.fields.ip"), value: toTextValue(transaction.ip_address) },
+    { label: t("admin.fields.transactionId"), value: toTextValue(transaction.id) },
   ];
 
   return fields
@@ -430,6 +454,7 @@ function buildTransactionFields(transaction: Record<string, unknown>): Array<{ l
 }
 
 export default function AdminPanel() {
+  const { t, locale } = useLang();
   const [summary, setSummary] = useState<TicketSummary | null>(null);
   const [tickets, setTickets] = useState<TicketListItem[]>([]);
   const [selectedTicketId, setSelectedTicketId] = useState<string | null>(null);
@@ -460,7 +485,7 @@ export default function AdminPanel() {
         setSelectedTicketId(firstTicketId);
       } catch {
         if (isMounted) {
-          setErrorMessage("No se pudo cargar la informacion del panel admin.");
+          setErrorMessage(t("admin.loadError"));
         }
       } finally {
         if (isMounted) {
@@ -473,7 +498,7 @@ export default function AdminPanel() {
     return () => {
       isMounted = false;
     };
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     let isMounted = true;
@@ -508,8 +533,8 @@ export default function AdminPanel() {
   }, [selectedTicketId]);
 
   const conversationMessages = useMemo(
-    () => buildConversationMessages(selectedTicket?.conversation_log),
-    [selectedTicket],
+    () => buildConversationMessages(selectedTicket?.conversation_log, t, locale),
+    [selectedTicket, t, locale],
   );
 
   const transactionFields = useMemo(() => {
@@ -517,13 +542,13 @@ export default function AdminPanel() {
     if (!transaction) {
       return [];
     }
-    return buildTransactionFields(transaction);
-  }, [selectedTicket]);
+    return buildTransactionFields(transaction, t, locale);
+  }, [selectedTicket, t, locale]);
 
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center rounded-xl border border-slate-200 bg-white text-sm text-gray-600 shadow-sm">
-        Cargando panel admin...
+        {t("admin.loadingPanel")}
       </div>
     );
   }
@@ -541,16 +566,20 @@ export default function AdminPanel() {
       <div className="flex min-h-0 flex-col gap-4 xl:col-span-4">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-            <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Tickets totales</p>
+            <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+              {t("admin.totalTickets")}
+            </p>
             <p className="mt-2 text-2xl font-bold text-brou-blue">{summary?.total ?? 0}</p>
           </div>
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-            <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Abiertos</p>
+            <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+              {t("admin.openTickets")}
+            </p>
             <p className="mt-2 text-2xl font-bold text-brou-blue">{summary?.open ?? 0}</p>
           </div>
           <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
             <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">
-              Cancelados por usuario
+              {t("admin.cancelledByUser")}
             </p>
             <p className="mt-2 text-2xl font-bold text-brou-blue">{summary?.cancelled_by_user ?? 0}</p>
           </div>
@@ -558,10 +587,10 @@ export default function AdminPanel() {
 
         <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-slate-200 bg-white shadow-sm">
           <div className="border-b border-slate-100 px-4 py-3 text-sm font-semibold text-gray-700">
-            Tickets
+            {t("admin.tickets")}
           </div>
           {tickets.length === 0 ? (
-            <div className="px-4 py-6 text-sm text-gray-500">No hay tickets cargados.</div>
+            <div className="px-4 py-6 text-sm text-gray-500">{t("admin.noTickets")}</div>
           ) : (
             <ul className="divide-y divide-slate-100">
               {tickets.map((ticket) => {
@@ -584,15 +613,19 @@ export default function AdminPanel() {
                             getStatusBadgeClass(ticket.status),
                           ].join(" ")}
                         >
-                          {getStatusLabel(ticket.status)}
+                          {getStatusLabel(ticket.status, t)}
                         </span>
                       </div>
-                      <p className="mt-1 text-xs text-gray-600">{ticket.reason_label_es}</p>
-                      <p className="mt-1 text-xs text-gray-500">
-                        {ticket.transaction?.merchant_name ?? "Sin transaccion"} -{" "}
-                        {formatAmount(ticket.transaction?.total_amount, ticket.transaction?.currency)}
+                      <p className="mt-1 text-xs text-gray-600">
+                        {getReasonLabel(ticket.reason_code, ticket.reason_label_es, t)}
                       </p>
-                      <p className="mt-1 text-[11px] text-gray-400">Creado: {formatDate(ticket.created_at)}</p>
+                      <p className="mt-1 text-xs text-gray-500">
+                        {ticket.transaction?.merchant_name ?? t("admin.noTransaction")} -{" "}
+                        {formatAmount(ticket.transaction?.total_amount, ticket.transaction?.currency, locale)}
+                      </p>
+                      <p className="mt-1 text-[11px] text-gray-400">
+                        {t("admin.createdAt", { date: formatDate(ticket.created_at, locale) })}
+                      </p>
                     </button>
                   </li>
                 );
@@ -603,45 +636,51 @@ export default function AdminPanel() {
       </div>
 
       <div className="min-h-0 overflow-y-auto rounded-xl border border-slate-200 bg-white p-4 shadow-sm xl:col-span-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-600">Detalle del ticket</h2>
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-600">
+          {t("admin.ticketDetail")}
+        </h2>
         {detailLoading ? (
-          <p className="mt-4 text-sm text-gray-500">Cargando detalle...</p>
+          <p className="mt-4 text-sm text-gray-500">{t("admin.loadingDetail")}</p>
         ) : !selectedTicket ? (
-          <p className="mt-4 text-sm text-gray-500">Selecciona un ticket para ver el detalle.</p>
+          <p className="mt-4 text-sm text-gray-500">{t("admin.selectTicketDetail")}</p>
         ) : (
           <div className="mt-3 space-y-3 text-sm text-gray-700">
             <p>
-              <span className="font-semibold text-gray-900">Numero:</span> {selectedTicket.ticket_number}
+              <span className="font-semibold text-gray-900">{t("admin.number")}</span>{" "}
+              {selectedTicket.ticket_number}
             </p>
             <p>
-              <span className="font-semibold text-gray-900">Estado:</span>{" "}
+              <span className="font-semibold text-gray-900">{t("admin.ticketStatus")}</span>{" "}
               <span
                 className={[
                   "ml-1 inline-flex rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase",
                   getStatusBadgeClass(selectedTicket.status),
                 ].join(" ")}
               >
-                {getStatusLabel(selectedTicket.status)}
+                {getStatusLabel(selectedTicket.status, t)}
               </span>
             </p>
             <p>
-              <span className="font-semibold text-gray-900">Motivo:</span> {selectedTicket.reason_label_es}
+              <span className="font-semibold text-gray-900">{t("admin.reason")}</span>{" "}
+              {getReasonLabel(selectedTicket.reason_code, selectedTicket.reason_label_es, t)}
             </p>
             <p>
-              <span className="font-semibold text-gray-900">Resumen:</span>{" "}
-              {selectedTicket.agent_summary || "Sin resumen"}
+              <span className="font-semibold text-gray-900">{t("admin.summary")}</span>{" "}
+              {selectedTicket.agent_summary || t("admin.noSummary")}
             </p>
             <p>
-              <span className="font-semibold text-gray-900">Recomendacion:</span>{" "}
-              {selectedTicket.agent_recommendation || "Sin recomendacion"}
+              <span className="font-semibold text-gray-900">{t("admin.recommendation")}</span>{" "}
+              {selectedTicket.agent_recommendation || t("admin.noRecommendation")}
             </p>
             <p>
-              <span className="font-semibold text-gray-900">Info adicional del cliente:</span>{" "}
-              {selectedTicket.user_additional_info || "Sin comentarios"}
+              <span className="font-semibold text-gray-900">{t("admin.additionalInfo")}</span>{" "}
+              {selectedTicket.user_additional_info || t("admin.noComments")}
             </p>
 
             <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-600">Transaccion</p>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-600">
+                {t("admin.transaction")}
+              </p>
               {transactionFields.length > 0 ? (
                 <dl className="grid grid-cols-1 gap-2 text-xs text-gray-700 sm:grid-cols-2">
                   {transactionFields.map((field) => (
@@ -652,7 +691,7 @@ export default function AdminPanel() {
                   ))}
                 </dl>
               ) : (
-                <p className="text-xs text-gray-500">Sin transaccion asociada.</p>
+                <p className="text-xs text-gray-500">{t("admin.noLinkedTransaction")}</p>
               )}
             </div>
           </div>
@@ -660,13 +699,15 @@ export default function AdminPanel() {
       </div>
 
       <div className="min-h-0 overflow-y-auto rounded-xl border border-slate-200 bg-white p-4 shadow-sm xl:col-span-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-600">Conversacion</h2>
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-600">
+          {t("admin.conversation")}
+        </h2>
         {detailLoading ? (
-          <p className="mt-4 text-sm text-gray-500">Cargando conversacion...</p>
+          <p className="mt-4 text-sm text-gray-500">{t("admin.loadingConversation")}</p>
         ) : !selectedTicket ? (
-          <p className="mt-4 text-sm text-gray-500">Selecciona un ticket para ver la conversacion.</p>
+          <p className="mt-4 text-sm text-gray-500">{t("admin.selectTicketConversation")}</p>
         ) : conversationMessages.length === 0 ? (
-          <p className="mt-4 text-sm text-gray-500">Sin registro de conversacion.</p>
+          <p className="mt-4 text-sm text-gray-500">{t("admin.noConversation")}</p>
         ) : (
           <div className="mt-3 space-y-3">
             {conversationMessages.map((message, index) => (
@@ -679,7 +720,7 @@ export default function AdminPanel() {
                     {message.roleLabel}
                   </p>
                   {message.timestamp ? (
-                    <p className="text-[11px] text-gray-500">{formatDate(message.timestamp)}</p>
+                    <p className="text-[11px] text-gray-500">{formatDate(message.timestamp, locale)}</p>
                   ) : null}
                 </div>
                 <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed">{message.content}</p>

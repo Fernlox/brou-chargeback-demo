@@ -123,7 +123,7 @@ class TransactionContextFormattingTests(unittest.TestCase):
         payload = tools._build_user_friendly_transaction_context(transaction)
 
         self.assertEqual(payload["business_type"], "supermercado")
-        self.assertEqual(payload["purchase_channel"], "presencial (tarjeta física)")
+        self.assertEqual(payload["purchase_channel"], "presencial (tarjeta fisica)")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,19 @@ from postgrest.exceptions import APIError
 from pydantic import BaseModel, Field
 
 try:
+    from .copy import CANONICAL_REASON_LABEL_ES, normalize_language
+except ImportError:  # pragma: no cover - supports running as script module
+    import importlib.util
+
+    _copy_spec = importlib.util.spec_from_file_location("backend_copy", Path(__file__).with_name("copy.py"))
+    if _copy_spec is None or _copy_spec.loader is None:  # pragma: no cover - defensive
+        raise RuntimeError("Failed to load backend copy module.")
+    _copy_module = importlib.util.module_from_spec(_copy_spec)
+    _copy_spec.loader.exec_module(_copy_module)
+    CANONICAL_REASON_LABEL_ES = _copy_module.CANONICAL_REASON_LABEL_ES
+    normalize_language = _copy_module.normalize_language
+
+try:
     from .db import get_supabase
 except ImportError:  # pragma: no cover - supports running as script module
     from db import get_supabase
@@ -35,26 +48,52 @@ RESULT_FIELDS = (
 )
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _COUNTRY_LABELS = {
-    "UY": "Uruguay",
-    "US": "Estados Unidos",
-    "AR": "Argentina",
-    "BR": "Brasil",
-    "CL": "Chile",
-    "PY": "Paraguay",
-    "CN": "China",
+    "es": {
+        "UY": "Uruguay",
+        "US": "Estados Unidos",
+        "AR": "Argentina",
+        "BR": "Brasil",
+        "CL": "Chile",
+        "PY": "Paraguay",
+        "CN": "China",
+    },
+    "en": {
+        "UY": "Uruguay",
+        "US": "United States",
+        "AR": "Argentina",
+        "BR": "Brazil",
+        "CL": "Chile",
+        "PY": "Paraguay",
+        "CN": "China",
+    },
 }
 _MCC_BUSINESS_TYPE_LABELS = {
-    "5411": "supermercado",
-    "5812": "restaurante o delivery",
-    "5814": "restaurante o delivery",
-    "5815": "servicio digital o streaming",
-    "4899": "servicio digital o suscripcion",
-    "4121": "transporte o movilidad",
-    "4814": "telecomunicaciones",
-    "5942": "ecommerce o retail",
-    "5999": "ecommerce o retail",
-    "5541": "estacion de servicio",
-    "5912": "farmacia",
+    "es": {
+        "5411": "supermercado",
+        "5812": "restaurante o delivery",
+        "5814": "restaurante o delivery",
+        "5815": "servicio digital o streaming",
+        "4899": "servicio digital o suscripcion",
+        "4121": "transporte o movilidad",
+        "4814": "telecomunicaciones",
+        "5942": "ecommerce o retail",
+        "5999": "ecommerce o retail",
+        "5541": "estacion de servicio",
+        "5912": "farmacia",
+    },
+    "en": {
+        "5411": "supermarket",
+        "5812": "restaurant or delivery",
+        "5814": "restaurant or delivery",
+        "5815": "digital service or streaming",
+        "4899": "digital service or subscription",
+        "4121": "transport or mobility",
+        "4814": "telecommunications",
+        "5942": "ecommerce or retail",
+        "5999": "ecommerce or retail",
+        "5541": "gas station",
+        "5912": "pharmacy",
+    },
 }
 
 _GEMINI_CLIENT: genai.Client | None = None
@@ -63,8 +102,8 @@ _GEMINI_CLIENT: genai.Client | None = None
 class RulesSummaryResponse(BaseModel):
     """Schema for rules summary output."""
 
-    summary: str = Field(description="Resumen del caso en 3-5 lineas.")
-    recommendation: str = Field(description="Accion concreta recomendada segun reglas.")
+    summary: str = Field(description="Case summary in 3-5 lines.")
+    recommendation: str = Field(description="Concrete recommended action based on rules.")
 
 
 def _coerce_amount(value: Any) -> float:
@@ -119,43 +158,55 @@ def _clean_string(value: Any) -> str | None:
     return normalized or None
 
 
-def _friendly_country(country_code: str | None) -> str | None:
+def _friendly_country(country_code: str | None, language: str = "es") -> str | None:
     """Map a country code to a user-friendly Spanish label."""
     if not country_code:
         return None
     normalized_code = country_code.strip().upper()
     if not normalized_code:
         return None
-    return _COUNTRY_LABELS.get(normalized_code, normalized_code)
+    labels = _COUNTRY_LABELS.get(normalize_language(language), _COUNTRY_LABELS["es"])
+    return labels.get(normalized_code, normalized_code)
 
 
-def _resolve_purchase_channel_label(transaction: dict[str, Any]) -> str | None:
+def _resolve_purchase_channel_label(transaction: dict[str, Any], language: str = "es") -> str | None:
     """Resolve channel as online or physical for customer-facing copy."""
     entry_mode = _clean_string(transaction.get("entry_mode"))
     card_present = transaction.get("card_present")
 
+    lang = normalize_language(language)
     if entry_mode == "online" or card_present is False:
         return "online"
     if entry_mode in {"chip", "contactless", "manual"} or card_present is True:
-        return "presencial (tarjeta física)"
+        return "presencial (tarjeta fisica)" if lang == "es" else "in-person (physical card)"
     return None
 
 
-def _build_user_friendly_transaction_context(transaction: dict[str, Any]) -> dict[str, Any]:
+def _build_user_friendly_transaction_context(
+    transaction: dict[str, Any], language: str = "es"
+) -> dict[str, Any]:
     """Build sanitized transaction context for customer confirmation copy."""
-    merchant_name = _clean_string(transaction.get("merchant_name")) or "comercio no identificado"
+    lang = normalize_language(language)
+    merchant_name = _clean_string(transaction.get("merchant_name")) or (
+        "comercio no identificado" if lang == "es" else "unknown merchant"
+    )
     merchant_dba = _clean_string(transaction.get("merchant_dba"))
     city = _clean_string(transaction.get("merchant_city"))
-    country_label = _friendly_country(_clean_string(transaction.get("merchant_country")))
+    country_label = _friendly_country(_clean_string(transaction.get("merchant_country")), language=lang)
 
     location_hint_parts = [part for part in (city, country_label) if part]
     location_hint = ", ".join(location_hint_parts) if location_hint_parts else None
 
     mcc = _clean_string(transaction.get("mcc"))
-    business_type = _MCC_BUSINESS_TYPE_LABELS.get(mcc) if mcc else None
+    business_labels = _MCC_BUSINESS_TYPE_LABELS.get(lang, _MCC_BUSINESS_TYPE_LABELS["es"])
+    business_type = business_labels.get(mcc) if mcc else None
 
     card_last4 = _clean_string(transaction.get("card_last4"))
-    card_used = f"tarjeta terminada en {card_last4}" if card_last4 else None
+    card_used = (
+        f"tarjeta terminada en {card_last4}"
+        if lang == "es"
+        else f"card ending in {card_last4}"
+    ) if card_last4 else None
 
     return {
         "id": transaction.get("id"),
@@ -167,7 +218,7 @@ def _build_user_friendly_transaction_context(transaction: dict[str, Any]) -> dic
         "location_hint": location_hint,
         "business_type": business_type,
         "card_used": card_used,
-        "purchase_channel": _resolve_purchase_channel_label(transaction),
+        "purchase_channel": _resolve_purchase_channel_label(transaction, language=lang),
     }
 
 
@@ -343,7 +394,7 @@ def search_transactions(
     return payload
 
 
-def get_transaction_context(transaction_id: str) -> dict[str, Any]:
+def get_transaction_context(transaction_id: str, language: str = "es") -> dict[str, Any]:
     """Get context details for a confirmed transaction.
 
     Args:
@@ -354,6 +405,7 @@ def get_transaction_context(transaction_id: str) -> dict[str, Any]:
         history metadata for user confirmation. If the transaction does not
         exist, returns `{"error": "transaction_not_found"}`.
     """
+    lang = normalize_language(language)
     if not transaction_id:
         raise ValueError("transaction_id is required.")
 
@@ -374,7 +426,7 @@ def get_transaction_context(transaction_id: str) -> dict[str, Any]:
     user_id = transaction["user_id"]
     merchant_name = transaction["merchant_name"]
     tx_timestamp = transaction["transaction_at"]
-    user_friendly_transaction = _build_user_friendly_transaction_context(transaction)
+    user_friendly_transaction = _build_user_friendly_transaction_context(transaction, language=lang)
 
     history_response = (
         client.table("transactions")
@@ -526,7 +578,7 @@ def create_chargeback_ticket(
     raise RuntimeError("Failed to create chargeback ticket after 3 attempts.") from last_error
 
 
-def apply_rules_and_summarize(ticket_id: str) -> dict[str, str]:
+def apply_rules_and_summarize(ticket_id: str, language: str = "es") -> dict[str, str]:
     """Apply rules.md to a ticket and persist summary/recommendation.
 
     Args:
@@ -535,6 +587,7 @@ def apply_rules_and_summarize(ticket_id: str) -> dict[str, str]:
     Returns:
         A dictionary with `summary` and `recommendation`.
     """
+    lang = normalize_language(language)
     if not ticket_id:
         raise ValueError("ticket_id is required.")
 
@@ -567,33 +620,62 @@ def apply_rules_and_summarize(ticket_id: str) -> dict[str, str]:
 
     rules_text = (REPO_ROOT / "rules.md").read_text(encoding="utf-8")
 
-    system_prompt = (
-        "Sos un sistema experto en gestion de contracargos de BROU. "
-        "Aplica las reglas indicadas al caso y devolve estrictamente el JSON pedido."
-    )
-    user_prompt = "\n\n".join(
-        [
-            "Reglas activas:",
-            rules_text,
-            "Datos del ticket:",
-            json.dumps(
-                {
-                    "id": ticket.get("id"),
-                    "status": ticket.get("status"),
-                    "reason_code": ticket.get("reason_code"),
-                    "reason_label_es": ticket.get("reason_label_es"),
-                    "user_additional_info": ticket.get("user_additional_info"),
-                    "conversation_log": ticket.get("conversation_log"),
-                    "created_at": ticket.get("created_at"),
-                },
-                ensure_ascii=False,
-                default=str,
-            ),
-            "Datos de transaccion asociada (si existe):",
-            json.dumps(transaction, ensure_ascii=False, default=str),
-            "Devolve JSON valido con campos `summary` y `recommendation`.",
-        ]
-    )
+    if lang == "en":
+        system_prompt = (
+            "You are an expert BROU chargeback management system. "
+            "Apply the provided rules to the case and return exactly the requested JSON."
+        )
+        user_prompt = "\n\n".join(
+            [
+                "Active rules:",
+                rules_text,
+                "Ticket data:",
+                json.dumps(
+                    {
+                        "id": ticket.get("id"),
+                        "status": ticket.get("status"),
+                        "reason_code": ticket.get("reason_code"),
+                        "reason_label_es": ticket.get("reason_label_es"),
+                        "user_additional_info": ticket.get("user_additional_info"),
+                        "conversation_log": ticket.get("conversation_log"),
+                        "created_at": ticket.get("created_at"),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                "Associated transaction data (if any):",
+                json.dumps(transaction, ensure_ascii=False, default=str),
+                "Return valid JSON with fields `summary` and `recommendation`.",
+            ]
+        )
+    else:
+        system_prompt = (
+            "Sos un sistema experto en gestion de contracargos de BROU. "
+            "Aplica las reglas indicadas al caso y devolve estrictamente el JSON pedido."
+        )
+        user_prompt = "\n\n".join(
+            [
+                "Reglas activas:",
+                rules_text,
+                "Datos del ticket:",
+                json.dumps(
+                    {
+                        "id": ticket.get("id"),
+                        "status": ticket.get("status"),
+                        "reason_code": ticket.get("reason_code"),
+                        "reason_label_es": ticket.get("reason_label_es"),
+                        "user_additional_info": ticket.get("user_additional_info"),
+                        "conversation_log": ticket.get("conversation_log"),
+                        "created_at": ticket.get("created_at"),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                "Datos de transaccion asociada (si existe):",
+                json.dumps(transaction, ensure_ascii=False, default=str),
+                "Devolve JSON valido con campos `summary` y `recommendation`.",
+            ]
+        )
 
     gemini_client = _get_gemini_client()
     response = gemini_client.models.generate_content(
@@ -643,6 +725,7 @@ def cancel_chargeback_request(
     transaction_id: str | None,
     conversation_log: list[dict[str, Any]],
     cancellation_reason: str,
+    language: str = "es",
 ) -> dict[str, str]:
     """Create a cancellation ticket for a chargeback flow.
 
@@ -662,11 +745,11 @@ def cancel_chargeback_request(
         user_id=user_id,
         transaction_id=transaction_id,
         reason_code="unknown_transaction",
-        reason_label_es="Desconocimiento de transacciones",
+        reason_label_es=CANONICAL_REASON_LABEL_ES,
         user_additional_info=cancellation_reason,
         conversation_log=conversation_log,
         status="cancelled_by_user",
         resolved_by="agent",
     )
-    apply_rules_and_summarize(ticket_id=created_ticket["ticket_id"])
+    apply_rules_and_summarize(ticket_id=created_ticket["ticket_id"], language=language)
     return created_ticket

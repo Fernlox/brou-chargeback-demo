@@ -89,7 +89,7 @@ class AgentGuardrailsTests(unittest.TestCase):
             }
 
         with (
-            patch.object(agent, "_ensure_runtime_ready", return_value=(_DummyClient(), "dummy", object())),
+            patch.object(agent, "_ensure_runtime_ready", return_value=(_DummyClient(), "dummy", [])),
             patch.object(agent, "_execute_tool_call", side_effect=fake_execute),
             patch.object(agent, "start_trace", return_value=_DummyTrace()),
             patch.object(agent, "log_user_turn", return_value=None),
@@ -139,7 +139,7 @@ class AgentGuardrailsTests(unittest.TestCase):
             }
         }
 
-        text = agent._build_transaction_confirmation_text(tool_result)
+        text = agent._build_transaction_confirmation_text(tool_result, "es")
 
         self.assertIn("NETFLIX.COM", text)
         self.assertIn("Montevideo, Uruguay", text)

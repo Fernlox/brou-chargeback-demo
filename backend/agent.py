@@ -19,6 +19,30 @@ from google import genai
 from google.genai import types
 
 try:
+    from .copy import (
+        CANONICAL_REASON_LABEL_ES,
+        continue_choices,
+        get_system_prompt,
+        msg,
+        normalize_language,
+        reason_choices,
+    )
+except ImportError:  # pragma: no cover - supports running from backend directory
+    import importlib.util
+
+    _copy_spec = importlib.util.spec_from_file_location("backend_copy", Path(__file__).with_name("copy.py"))
+    if _copy_spec is None or _copy_spec.loader is None:  # pragma: no cover - defensive
+        raise RuntimeError("Failed to load backend copy module.")
+    _copy_module = importlib.util.module_from_spec(_copy_spec)
+    _copy_spec.loader.exec_module(_copy_module)
+    CANONICAL_REASON_LABEL_ES = _copy_module.CANONICAL_REASON_LABEL_ES
+    continue_choices = _copy_module.continue_choices
+    get_system_prompt = _copy_module.get_system_prompt
+    msg = _copy_module.msg
+    normalize_language = _copy_module.normalize_language
+    reason_choices = _copy_module.reason_choices
+
+try:
     from .tools import (
         apply_rules_and_summarize,
         cancel_chargeback_request,
@@ -56,128 +80,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
 logger = logging.getLogger(__name__)
 
-COST_WARNING_TEXT = (
-    "IMPORTANTE\n"
-    "Iniciar un reclamo de contracargo es un proceso formal.\n"
-    "Si el reclamo se resuelve a favor del comercio, podrías incurrir en costos "
-    "administrativos según el reglamento vigente de BROU.\n"
-    "¿Confirmás que querés continuar?"
-)
-
-OPTIONAL_INFO_PROMPT_TEXT = (
-    "¿Querés agregar algún detalle adicional sobre este cargo antes de crear el reclamo?\n"
-    "Si no tenés nada más para agregar, escribí 'continuar'."
-)
-
-REASON_CHOICES: list[dict[str, str]] = [
-    {
-        "id": "reason_unknown_transaction",
-        "label": "Desconocimiento de transacciones (no reconozco un cargo)",
-        "value": "Desconocimiento de transacciones (no reconozco un cargo)",
-    },
-    {
-        "id": "reason_not_received",
-        "label": "No recibí el servicio o la mercadería",
-        "value": "No recibí el servicio o la mercadería",
-    },
-    {
-        "id": "reason_duplicate",
-        "label": "Compra o retiro duplicado",
-        "value": "Compra o retiro duplicado",
-    },
-    {
-        "id": "reason_processing_error",
-        "label": "Error de procesamiento (la transacción dio error pero igual se procesó)",
-        "value": "Error de procesamiento (la transacción dio error pero igual se procesó)",
-    },
-]
-
-CONTINUE_CHOICES: list[dict[str, str]] = [
-    {
-        "id": "continue_yes",
-        "label": "Sí, quiero seguir adelante",
-        "value": "Sí, quiero seguir adelante",
-    },
-    {
-        "id": "continue_no",
-        "label": "No, prefiero cancelar",
-        "value": "No, prefiero cancelar",
-    },
-]
-
 _DATE_EXPR_RE = re.compile(r"\b([0-3]?\d)[/\-]([0-1]?\d)(?:[/\-](\d{2,4}))?\b")
 _NUMBER_EXPR_RE = re.compile(r"\b\d+(?:[.,]\d{1,2})?\b")
-_SELECT_TX_RE = re.compile(
+_SELECT_TX_VALUE_RE = re.compile(
+    r"tx_select:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+_SELECT_TX_LEGACY_RE = re.compile(
     r"selecciono la transacci[oó]n\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
-
-SYSTEM_PROMPT = f"""
-Sos el Asistente de Reclamos de BROU.
-Hablás en español rioplatense (uruguayo), usando "vos", "podés" y tono cordial,
-formal pero cercano.
-
-REGLAS CRITICAS:
-1) Tu primer mensaje SIEMPRE debe ser una pregunta abierta y NO debe mencionar
-   motivos de contracargo. Ejemplo: "Hola, soy el asistente de BROU. ¿En qué te
-   puedo ayudar?"
-2) Clasificá internamente el primer mensaje del usuario:
-   - chargeback_intent: cargos no reconocidos, movimientos raros, reclamo de tarjeta.
-   - other: saldos, sucursales, préstamos u otros temas.
-3) Si es "other", derivá amablemente a asistencia.brou.com.uy o WhatsApp 21996000
-   y no continúes el flujo de reclamo. No llames tools ni crees tickets en este caso.
-4) Si es "chargeback_intent", decidí si el motivo ya está claro:
-   - Si el usuario ya describe claramente "Desconocimiento de transacciones"
-     (ej. "no reconozco el cargo", "cargo equivocado", "movimiento raro", "esa compra no la hice"),
-     tomalo como motivo confirmado y pasá directo al paso 2 (Identificar transacción).
-   - Solo si el motivo está ambiguo o genérico, presentá estas 4 opciones de motivo:
-   1. Desconocimiento de transacciones (no reconozco un cargo)
-   2. No recibí el servicio o la mercadería
-   3. Compra o retiro duplicado
-   4. Error de procesamiento (la transacción dio error pero igual se procesó)
-5) En esta demo SOLO está implementado el flujo "Desconocimiento de transacciones".
-6) Solo continuá el flujo si el motivo es "Desconocimiento de transacciones" (ya sea por confirmación
-   explícita o por detección clara en el mensaje del usuario).
-7) Si el usuario elige motivo 2, 3 o 4, respondé exactamente:
-   "Por ahora ese flujo no está disponible en la demo. ¿Querés que volvamos al inicio o necesitás otra cosa?"
-   En ese caso no llames tools, no continúes el flujo y no crees ticket.
-8) Si luego el usuario reformula y aclara que en realidad es "Desconocimiento de transacciones",
-   retomá el flujo en el paso 2 (Identificar transacción).
-
-FLUJO (EN ORDEN):
-2) Identificar transacción:
-   - Usá search_transactions.
-   - Si el monto es aproximado, buscá por aproximación.
-   - Mostrá como máximo 5 candidatos.
-   - Pedí confirmación explícita de la transacción correcta.
-3) Contexto:
-   - Usá get_transaction_context.
-   - Mostrá un resumen claro y no técnico para ayudar a validar la compra
-     (comercio, ubicación, tipo de negocio, tarjeta usada y si fue online o presencial).
-   - No muestres datos técnicos internos (por ejemplo MCC numérico, IP, terminal o IDs técnicos).
-4) Advertencia de costos:
-   - Debés mostrar textual este mensaje y esperar confirmación:
-   "{COST_WARNING_TEXT}"
-5) Pedí información adicional opcional (texto libre).
-6) Creá ticket usando create_chargeback_ticket.
-7) Tras crear ticket, se debe aplicar apply_rules_and_summarize y cerrar con:
-   - número de ticket,
-   - mensaje cordial de cierre,
-   - sin mostrar recomendaciones internas.
-
-CANCELACION:
-- Si el usuario quiere cancelar en cualquier momento (ej. "cancelar", "dejá",
-  "no quiero seguir", "olvidate"), confirmá amablemente.
-- Usá cancel_chargeback_request con conversation_log completo y un
-  cancellation_reason breve inferido del contexto.
-- Cerrá el flujo con despedida cordial.
-
-RESTRICCIONES:
-- Prohibido dar consejos legales.
-- Prohibido prometer resolución favorable.
-- Prohibido inventar datos.
-- Prohibido saltear la advertencia de costos.
-- Si el usuario está enojado, empatizá antes de continuar.
-""".strip()
 
 _TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "search_transactions": search_transactions,
@@ -192,7 +102,7 @@ _SESSION_TRANSCRIPTS: dict[str, list[dict[str, str]]] = {}
 _SESSION_STATE: dict[str, dict[str, Any]] = {}
 _GEMINI_CLIENT: genai.Client | None = None
 _GEMINI_MODEL: str | None = None
-_GEMINI_CONFIG: types.GenerateContentConfig | None = None
+_GEMINI_TOOLS: list[types.Tool] | None = None
 
 
 def _build_tools_config() -> list[types.Tool]:
@@ -215,7 +125,10 @@ def _build_tools_config() -> list[types.Tool]:
         },
         "get_transaction_context": {
             "type": "object",
-            "properties": {"transaction_id": {"type": "string"}},
+            "properties": {
+                "transaction_id": {"type": "string"},
+                "language": {"type": "string", "enum": ["es", "en"]},
+            },
             "required": ["transaction_id"],
         },
         "create_chargeback_ticket": {
@@ -236,6 +149,7 @@ def _build_tools_config() -> list[types.Tool]:
                 "transaction_id": {"type": "string"},
                 "conversation_log": {"type": "array", "items": {"type": "object"}},
                 "cancellation_reason": {"type": "string"},
+                "language": {"type": "string", "enum": ["es", "en"]},
             },
             "required": ["user_id", "conversation_log", "cancellation_reason"],
         },
@@ -243,6 +157,7 @@ def _build_tools_config() -> list[types.Tool]:
             "type": "object",
             "properties": {
                 "ticket_id": {"type": "string"},
+                "language": {"type": "string", "enum": ["es", "en"]},
             },
             "required": ["ticket_id"],
         },
@@ -263,9 +178,9 @@ def _build_tools_config() -> list[types.Tool]:
     return [types.Tool(function_declarations=declarations)]
 
 
-def _ensure_runtime_ready() -> tuple[genai.Client, str, types.GenerateContentConfig]:
+def _ensure_runtime_ready() -> tuple[genai.Client, str, list[types.Tool]]:
     """Lazily initialize Gemini runtime dependencies."""
-    global _GEMINI_CLIENT, _GEMINI_MODEL, _GEMINI_CONFIG
+    global _GEMINI_CLIENT, _GEMINI_MODEL, _GEMINI_TOOLS
 
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     gemini_model = os.getenv("GEMINI_MODEL")
@@ -277,13 +192,10 @@ def _ensure_runtime_ready() -> tuple[genai.Client, str, types.GenerateContentCon
 
     if _GEMINI_CLIENT is None:
         _GEMINI_CLIENT = genai.Client(api_key=gemini_api_key)
-    if _GEMINI_CONFIG is None:
-        _GEMINI_CONFIG = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            tools=_build_tools_config(),
-        )
+    if _GEMINI_TOOLS is None:
+        _GEMINI_TOOLS = _build_tools_config()
     _GEMINI_MODEL = gemini_model
-    return _GEMINI_CLIENT, _GEMINI_MODEL, _GEMINI_CONFIG
+    return _GEMINI_CLIENT, _GEMINI_MODEL, _GEMINI_TOOLS
 
 
 def _get_session_history(session_id: str) -> list[types.Content]:
@@ -329,7 +241,9 @@ def _normalize_text(text: str) -> str:
 def _extract_selected_transaction_id(text: str) -> str | None:
     """Extract selected transaction UUID from quick-reply user text."""
     normalized = _normalize_text(" ".join(text.strip().split()))
-    match = _SELECT_TX_RE.search(normalized)
+    match = _SELECT_TX_VALUE_RE.search(normalized)
+    if not match:
+        match = _SELECT_TX_LEGACY_RE.search(normalized)
     if not match:
         return None
     return match.group(1)
@@ -367,7 +281,7 @@ def _extract_transaction_search_slots(
         except ValueError:
             pass
 
-    if re.search(r"\b(?:u\$s|usd|dolares?|dolar)\b", normalized):
+    if re.search(r"\b(?:u\$s|usd|dolares?|dolar|dollars?)\b", normalized):
         extracted["currency"] = "USD"
     elif re.search(r"\b(?:uyu|pesos uruguayos?|pesos?)\b", normalized):
         extracted["currency"] = "UYU"
@@ -388,12 +302,17 @@ def _extract_transaction_search_slots(
                     "exacta",
                     "monto exacto",
                     "monto exacta",
+                    "exact",
+                    "exact amount",
                 )
                 approximate_markers = (
                     "aprox",
                     "aproxim",
                     "unos",
                     "mas o menos",
+                    "about",
+                    "around",
+                    "approximately",
                 )
                 is_exact = any(marker in normalized for marker in exact_markers)
                 is_approximate = any(marker in normalized for marker in approximate_markers)
@@ -482,6 +401,10 @@ def _is_latest_search_candidate(state: dict[str, Any], transaction_id: str | Non
 def _classify_chargeback_reason_hint(text: str) -> str:
     """Return coarse reason hint: unknown_transaction, other_reason, ambiguous_chargeback, none."""
     normalized = _normalize_text(text)
+    if "reason:unknown_transaction" in normalized:
+        return "unknown_transaction"
+    if re.search(r"reason:(not_received|duplicate|processing_error)", normalized):
+        return "other_reason"
 
     unknown_patterns = (
         "no reconozco",
@@ -493,6 +416,14 @@ def _classify_chargeback_reason_hint(text: str) -> str:
         "no hice esa compra",
         "no hice ese cargo",
         "desconozco este cargo",
+        "unknown transaction",
+        "do not recognize",
+        "dont recognize",
+        "i did not make this",
+        "i didnt make this",
+        "i did not make that purchase",
+        "unauthorized charge",
+        "unrecognized charge",
     )
     other_reason_patterns = (
         "no recibi",
@@ -505,6 +436,14 @@ def _classify_chargeback_reason_hint(text: str) -> str:
         "error de procesamiento",
         "dio error pero",
         "rechazada pero cobrada",
+        "did not receive",
+        "didnt receive",
+        "duplicate purchase",
+        "duplicate withdrawal",
+        "double charge",
+        "charged twice",
+        "processing error",
+        "failed but charged",
     )
     chargeback_generic_patterns = (
         "cargo",
@@ -512,6 +451,11 @@ def _classify_chargeback_reason_hint(text: str) -> str:
         "reclamo",
         "contracargo",
         "movimiento",
+        "charge",
+        "card",
+        "chargeback",
+        "claim",
+        "transaction",
     )
 
     if any(pattern in normalized for pattern in other_reason_patterns):
@@ -523,46 +467,54 @@ def _classify_chargeback_reason_hint(text: str) -> str:
     return "none"
 
 
-def _build_routing_hint(reason_hint: str) -> str | None:
+def _build_routing_hint(reason_hint: str, language: str) -> str | None:
     """Build internal routing guidance for the model."""
     if reason_hint == "unknown_transaction":
-        return (
-            "[INTERNAL_ROUTING_HINT] El usuario ya confirmó de forma implícita "
-            "el motivo 'Desconocimiento de transacciones'. No pidas menú de 4 motivos. "
-            "Continuá directo con identificación de transacción."
-        )
+        return msg(language, "routing_hint_unknown")
     if reason_hint == "other_reason":
-        return (
-            "[INTERNAL_ROUTING_HINT] El usuario parece estar describiendo un motivo de "
-            "contracargo distinto a 'Desconocimiento de transacciones'. Aplicá la respuesta "
-            "de flujo no disponible para esta demo."
-        )
+        return msg(language, "routing_hint_other")
     return None
 
 
 def _response_mentions_reason_menu(response_text: str) -> bool:
     """Detect if model answer is presenting the 4 reason options."""
     normalized = _normalize_text(response_text)
-    return (
+    spanish_menu = (
         "desconocimiento de transacciones" in normalized
         and "no recibi el servicio" in normalized
         and "compra o retiro duplicado" in normalized
         and "error de procesamiento" in normalized
     )
+    english_menu = (
+        "unknown transaction" in normalized
+        and "did not receive" in normalized
+        and "duplicate purchase" in normalized
+        and "processing error" in normalized
+    )
+    return spanish_menu or english_menu
 
 
-def _response_requests_continue_confirmation(response_text: str) -> bool:
+def _response_requests_continue_confirmation(response_text: str, language: str) -> bool:
     """Detect if model asks explicit continue/cancel confirmation."""
     normalized = _normalize_text(response_text)
-    if _normalize_text(COST_WARNING_TEXT) in normalized:
+    if _normalize_text(msg(language, "cost_warning_text")) in normalized:
         return True
-    return "confirmas que queres continuar" in normalized or "queres seguir adelante" in normalized
+    return (
+        "confirmas que queres continuar" in normalized
+        or "queres seguir adelante" in normalized
+        or "confirm you want to continue" in normalized
+        or "do you want to continue" in normalized
+    )
 
 
 def _looks_like_continue_confirmation(text: str) -> bool:
     """Detect user intent to continue while waiting explicit confirmation."""
     normalized = _normalize_text(" ".join(text.strip().split()))
     if not normalized:
+        return False
+    if normalized == "continue:yes":
+        return True
+    if normalized == "continue:no":
         return False
 
     explicit_phrases = (
@@ -575,11 +527,16 @@ def _looks_like_continue_confirmation(text: str) -> bool:
         "dale continuar",
         "si confirma",
         "si confirmo",
+        "yes i want to continue",
+        "i want to continue",
+        "i confirm i want to continue",
+        "i confirm continue",
+        "please continue",
     )
     if any(phrase in normalized for phrase in explicit_phrases):
         return True
 
-    short_confirmations = {"si", "ok", "dale", "continuar", "confirmo", "de acuerdo"}
+    short_confirmations = {"si", "ok", "dale", "continuar", "confirmo", "de acuerdo", "yes", "continue"}
     return normalized in short_confirmations
 
 
@@ -591,8 +548,9 @@ def _build_quick_reply_payload(
     return {"group": group, "choices": choices}
 
 
-def _build_transaction_quick_replies(tool_result: dict[str, Any]) -> list[dict[str, str]]:
+def _build_transaction_quick_replies(tool_result: dict[str, Any], language: str) -> list[dict[str, str]]:
     """Build quick replies for transaction selection from search results."""
+    lang = normalize_language(language)
     payload = tool_result.get("result")
     if not isinstance(payload, dict):
         return []
@@ -623,6 +581,8 @@ def _build_transaction_quick_replies(tool_result: dict[str, Any]) -> list[dict[s
             date_repr = date_raw
         card_suffix = (
             f" (Tarjeta terminada en {card_last4})"
+            if lang == "es" and isinstance(card_last4, str) and card_last4.strip()
+            else f" (Card ending in {card_last4})"
             if isinstance(card_last4, str) and card_last4.strip()
             else ""
         )
@@ -631,7 +591,7 @@ def _build_transaction_quick_replies(tool_result: dict[str, Any]) -> list[dict[s
             {
                 "id": f"tx_{transaction_id}",
                 "label": display_text,
-                "value": f"Selecciono la transacción {transaction_id}",
+                "value": f"tx_select:{transaction_id}",
                 "display_text": display_text,
             }
         )
@@ -659,6 +619,8 @@ def _looks_like_cancellation(text: str) -> bool:
     normalized = _normalize_text(text)
     if not normalized:
         return False
+    if normalized == "continue:no":
+        return True
 
     phrase_keywords = (
         "no quiero seguir",
@@ -667,23 +629,27 @@ def _looks_like_cancellation(text: str) -> bool:
         "no quiero continuar",
         "quiero cancelar",
         "prefiero cancelar",
+        "i want to cancel",
+        "prefer to cancel",
+        "do not continue",
+        "dont continue",
     )
     if any(keyword in normalized for keyword in phrase_keywords):
         return True
 
-    token_keywords = {"cancelar", "cancela", "deja"}
+    token_keywords = {"cancelar", "cancela", "deja", "cancel", "stop"}
     tokens = re.findall(r"[a-z0-9]+", normalized)
     return any(token in token_keywords for token in tokens)
 
 
-def _infer_cancellation_reason(user_message: str) -> str:
+def _infer_cancellation_reason(user_message: str, language: str) -> str:
     """Generate a short cancellation reason from the user text."""
     normalized = " ".join(user_message.strip().split())
     if not normalized:
-        return "El usuario solicito cancelar el reclamo."
+        return msg(language, "cancellation_reason_empty")
     if len(normalized) > 140:
         normalized = normalized[:137].rstrip() + "..."
-    return f"El usuario solicito cancelar: {normalized}"
+    return msg(language, "cancellation_reason_prefix", message=normalized)
 
 
 def _last_agent_message(session_id: str) -> str | None:
@@ -705,7 +671,13 @@ def _is_optional_info_prompt(agent_message: str) -> bool:
         and "agregar" in normalized
         and ("continuar" in normalized or "no tengo nada mas para agregar" in normalized)
     )
-    return has_optional_info_prompt
+    if has_optional_info_prompt:
+        return True
+    return (
+        "additional detail" in normalized
+        and "before creating the claim" in normalized
+        and ("type 'continue'" in agent_message.lower() or "type continue" in normalized)
+    )
 
 
 def _extract_additional_info(user_message: str) -> str | None:
@@ -716,6 +688,7 @@ def _extract_additional_info(user_message: str) -> str | None:
 
     normalized = _normalize_text(compact)
     no_info_patterns = (
+        "continue:yes",
         "continuar",
         "continua",
         "continuemos",
@@ -725,6 +698,11 @@ def _extract_additional_info(user_message: str) -> str | None:
         "no tengo nada para agregar",
         "nada mas para agregar",
         "no hay nada mas para agregar",
+        "continue",
+        "go on",
+        "nothing else to add",
+        "i have nothing else to add",
+        "no additional details",
     )
     if any(pattern == normalized or pattern in normalized for pattern in no_info_patterns):
         return None
@@ -743,38 +721,29 @@ def _is_optional_info_follow_up(session_id: str) -> bool:
     return _is_optional_info_prompt(last_agent_message)
 
 
-def _build_ticket_confirmation_text(tool_result: dict[str, Any]) -> str:
+def _build_ticket_confirmation_text(tool_result: dict[str, Any], language: str) -> str:
     """Create the final user-facing closure message after ticket creation."""
     payload = tool_result.get("result")
     if not isinstance(payload, dict):
-        return (
-            "Tu solicitud quedó registrada, pero no pude confirmar el número de ticket "
-            "en este momento. Si querés, lo intento de nuevo."
-        )
+        return msg(language, "ticket_confirmation_missing")
 
     ticket_number = payload.get("ticket_number")
     if not isinstance(ticket_number, str) or not ticket_number.strip():
-        return (
-            "Tu solicitud quedó registrada, pero no pude confirmar el número de ticket "
-            "en este momento. Si querés, lo intento de nuevo."
-        )
+        return msg(language, "ticket_confirmation_missing")
 
-    message = (
-        f"Perfecto, ya creé el ticket {ticket_number} para tu reclamo. "
-        "Guardalo para hacer seguimiento cuando quieras."
-    )
-    return f"{message}\nGracias por contactarte."
+    message = msg(language, "ticket_confirmation_success", ticket_number=ticket_number)
+    return f"{message}\n{msg(language, 'thanks')}"
 
 
-async def _apply_rules_summary_background(ticket_id: str) -> None:
+async def _apply_rules_summary_background(ticket_id: str, language: str) -> None:
     """Run ticket summarization off the user-facing critical path."""
     try:
-        await asyncio.to_thread(apply_rules_and_summarize, ticket_id=ticket_id)
+        await asyncio.to_thread(apply_rules_and_summarize, ticket_id=ticket_id, language=language)
     except Exception:
         logger.exception("Background apply_rules_and_summarize failed for ticket_id=%s", ticket_id)
 
 
-def _schedule_rules_summary_from_tool_result(tool_result: dict[str, Any]) -> None:
+def _schedule_rules_summary_from_tool_result(tool_result: dict[str, Any], language: str) -> None:
     """Schedule async rules summary if tool result includes a valid ticket_id."""
     payload = tool_result.get("result")
     if not isinstance(payload, dict):
@@ -793,7 +762,7 @@ def _schedule_rules_summary_from_tool_result(tool_result: dict[str, Any]) -> Non
         )
         return
 
-    loop.create_task(_apply_rules_summary_background(ticket_id=ticket_id))
+    loop.create_task(_apply_rules_summary_background(ticket_id=ticket_id, language=language))
 
 
 def _format_transaction_date(transaction_at: str) -> str:
@@ -805,23 +774,17 @@ def _format_transaction_date(transaction_at: str) -> str:
     return date_raw
 
 
-def _build_transaction_confirmation_text(tool_result: dict[str, Any]) -> str:
+def _build_transaction_confirmation_text(tool_result: dict[str, Any], language: str) -> str:
     """Build deterministic confirmation + deterrence after selected transaction context."""
     payload = tool_result.get("result")
     if not isinstance(payload, dict):
-        return (
-            "No pude validar esa transacción con la información disponible. "
-            "¿Me compartís un dato más para volver a buscar?"
-        )
+        return msg(language, "transaction_context_missing")
 
     transaction = payload.get("transaction")
     if not isinstance(transaction, dict):
-        return (
-            "No encontré contexto válido para esa transacción. "
-            "¿Me compartís otro dato del cargo para volver a buscar?"
-        )
+        return msg(language, "transaction_context_invalid")
 
-    merchant_name = str(transaction.get("merchant_name") or "comercio no identificado").strip()
+    merchant_name = str(transaction.get("merchant_name") or msg(language, "merchant_fallback")).strip()
     merchant_display_name = str(transaction.get("merchant_display_name") or merchant_name).strip()
     currency = str(transaction.get("currency") or "USD").strip()
     transaction_at = str(transaction.get("transaction_at") or "").strip()
@@ -834,66 +797,50 @@ def _build_transaction_confirmation_text(tool_result: dict[str, Any]) -> str:
     amount_repr = "?"
     if isinstance(total_amount, (int, float)):
         amount_repr = f"{float(total_amount):.2f}"
-    date_repr = _format_transaction_date(transaction_at) if transaction_at else "fecha no disponible"
+    date_repr = _format_transaction_date(transaction_at) if transaction_at else msg(language, "date_unavailable")
 
     summary_lines: list[str] = [
-        f"Entendido, es el cargo de {currency} {amount_repr} en {merchant_name} "
-        f"del {date_repr}."
+        msg(
+            language,
+            "tx_confirm_intro",
+            currency=currency,
+            amount=amount_repr,
+            merchant=merchant_name,
+            date=date_repr,
+        )
     ]
     if merchant_display_name and merchant_display_name.lower() != merchant_name.lower():
-        summary_lines.append(f"Figura con el nombre comercial {merchant_display_name}.")
+        summary_lines.append(msg(language, "tx_confirm_display_name", name=merchant_display_name))
     if location_hint:
-        summary_lines.append(f"La compra aparece ubicada en {location_hint}.")
+        summary_lines.append(msg(language, "tx_confirm_location", location=location_hint))
     if business_type:
-        summary_lines.append(f"Parece ser un consumo de tipo {business_type}.")
+        summary_lines.append(msg(language, "tx_confirm_business_type", business_type=business_type))
     if card_used:
-        summary_lines.append(f"Se realizó con la {card_used}.")
+        summary_lines.append(msg(language, "tx_confirm_card", card_used=card_used))
     if purchase_channel:
-        summary_lines.append(f"Se registró como compra {purchase_channel}.")
+        summary_lines.append(msg(language, "tx_confirm_channel", purchase_channel=purchase_channel))
 
     message = "\n".join(summary_lines)
 
     same_merchant_count_6m = payload.get("same_merchant_count_6m")
     has_prior_with_merchant = isinstance(same_merchant_count_6m, int) and same_merchant_count_6m > 0
     if has_prior_with_merchant:
-        message = (
-            f"{message}\nAdemás, veo {same_merchant_count_6m} compra(s) previa(s) en este comercio "
-            "durante los últimos 6 meses."
-        )
+        message = f"{message}\n{msg(language, 'tx_confirm_prior_count', count=same_merchant_count_6m)}"
 
-    return (
-        f"{message}\n"
-        "¿Querés continuar con el reclamo de esta transacción?"
-    )
+    return f"{message}\n{msg(language, 'tx_confirm_ask_continue')}"
 
 
-def _build_transaction_selection_text(tool_result: dict[str, Any]) -> str:
+def _build_transaction_selection_text(tool_result: dict[str, Any], language: str) -> str:
     """Build deterministic copy for transaction quick-reply turns."""
     payload = tool_result.get("result")
     if not isinstance(payload, dict):
-        return (
-            "Ok, encontré transacciones. Seleccioná una para continuar o, "
-            "si no está acá, dame algún otro detalle del cargo para volver a buscar."
-        )
+        return msg(language, "tx_selection_fallback")
 
     raw_results = payload.get("results")
     if not isinstance(raw_results, list) or not raw_results:
-        return (
-            "No encontré transacciones que coincidan con ese detalle. "
-            "¿Me compartís algún otro dato del cargo para volver a buscar?"
-        )
+        return msg(language, "tx_selection_no_results")
 
-    merchant_name = ""
-    first_result = raw_results[0]
-    if isinstance(first_result, dict):
-        maybe_merchant = first_result.get("merchant_name")
-        if isinstance(maybe_merchant, str):
-            merchant_name = maybe_merchant.strip()
-
-    return (
-        "Ok, encontré estas transacciones. Seleccioná una para continuar o, "
-        "si no está acá, dame algún otro detalle del cargo para volver a buscar."
-    )
+    return msg(language, "tx_selection_found")
 
 
 def reset_session(session_id: str) -> None:
@@ -919,9 +866,11 @@ def _execute_tool_call(
     fn = _TOOL_FUNCTIONS.get(tool_name)
     if fn is None:
         return {"error": f"Unknown tool: {tool_name}"}
+    state = _get_session_state(session_id)
+    language = normalize_language(state.get("language"))
 
     if tool_name == "search_transactions":
-        slots = _get_session_state(session_id).get("search_slots")
+        slots = state.get("search_slots")
         if isinstance(slots, dict):
             if isinstance(slots.get("date_from"), str):
                 args["date_from"] = slots["date_from"]
@@ -952,12 +901,12 @@ def _execute_tool_call(
         if not args.get("user_id") or args.get("user_id") == "DEMO_USER_ID":
             args["user_id"] = demo_user_id
         if not args.get("transaction_id"):
-            transaction_id = _get_session_state(session_id).get("transaction_id")
+            transaction_id = state.get("transaction_id")
             if transaction_id:
                 args["transaction_id"] = transaction_id
         if args.get("reason_code") != "unknown_transaction":
             args["reason_code"] = "unknown_transaction"
-        args.setdefault("reason_label_es", "Desconocimiento de transacciones")
+        args.setdefault("reason_label_es", CANONICAL_REASON_LABEL_ES)
         args.setdefault("user_additional_info", None)
         args.setdefault("status", "open")
         args.setdefault("resolved_by", None)
@@ -968,6 +917,8 @@ def _execute_tool_call(
 
     if tool_name in {"create_chargeback_ticket", "cancel_chargeback_request"}:
         args.setdefault("conversation_log", _snapshot_transcript(session_id))
+    if tool_name in {"cancel_chargeback_request", "apply_rules_and_summarize", "get_transaction_context"}:
+        args.setdefault("language", language)
 
     args_for_log = {key: value for key, value in args.items() if key != "conversation_log"}
     tool_call_repr = _format_tool_call(tool_name, args_for_log)
@@ -1080,7 +1031,7 @@ def _extract_token_usage(
     return input_tokens, output_tokens
 
 
-async def run_agent_turn(session_id: str, user_message: str):
+async def run_agent_turn(session_id: str, user_message: str, language: str = "es"):
     """Run one agent turn and yield SSE-style events.
 
     Yields:
@@ -1095,27 +1046,30 @@ async def run_agent_turn(session_id: str, user_message: str):
     if not user_message or not user_message.strip():
         raise ValueError("user_message is required.")
 
-    client, model_name, config = _ensure_runtime_ready()
+    client, model_name, tools_config = _ensure_runtime_ready()
     history = _get_session_history(session_id)
     _get_session_transcript(session_id)
+    state = _get_session_state(session_id)
+    lang = normalize_language(language or state.get("language"))
+    state["language"] = lang
+
+    config = types.GenerateContentConfig(
+        system_instruction=get_system_prompt(lang),
+        tools=tools_config,
+    )
     reason_hint = _classify_chargeback_reason_hint(user_message)
-    routing_hint = _build_routing_hint(reason_hint)
+    routing_hint = _build_routing_hint(reason_hint, lang)
     user_parts = [types.Part.from_text(text=user_message)]
     if routing_hint:
         user_parts.append(types.Part.from_text(text=routing_hint))
     history.append(types.Content(role="user", parts=user_parts))
-    state = _get_session_state(session_id)
     state["last_reason_hint"] = reason_hint
     _append_transcript_entry(session_id, "user", user_message.strip())
     trace = start_trace(session_id=session_id, user_message=user_message)
     log_user_turn(trace, user_message)
 
     if _looks_like_cancellation(user_message):
-        cancellation_text = (
-            "Perfecto, ya cancelé el proceso de reclamo. "
-            "Si querés, más adelante lo retomamos juntos. "
-            "Gracias por contactarte."
-        )
+        cancellation_text = msg(lang, "cancellation_text")
         if state.get("chargeback_flow_cancelled"):
             _append_transcript_entry(session_id, "agent", cancellation_text)
             for chunk in _chunk_text_for_sse(cancellation_text):
@@ -1129,7 +1083,8 @@ async def run_agent_turn(session_id: str, user_message: str):
             return
 
         cancellation_args: dict[str, Any] = {
-            "cancellation_reason": _infer_cancellation_reason(user_message),
+            "cancellation_reason": _infer_cancellation_reason(user_message, lang),
+            "language": lang,
         }
         transaction_id = _get_session_state(session_id).get("transaction_id")
         if transaction_id:
@@ -1179,24 +1134,22 @@ async def run_agent_turn(session_id: str, user_message: str):
         if _looks_like_continue_confirmation(user_message):
             state["awaiting_transaction_confirmation"] = False
             state["awaiting_cost_warning_confirmation"] = True
-            warning_text = COST_WARNING_TEXT
+            warning_text = msg(lang, "cost_warning_text")
             _append_transcript_entry(session_id, "agent", warning_text)
             for chunk in _chunk_text_for_sse(warning_text):
                 yield {"event": "token", "data": {"text": chunk}}
             yield {
                 "event": "quick_replies",
-                "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+                "data": _build_quick_reply_payload(continue_choices(lang), "continue_confirmation"),
             }
         else:
-            reminder_text = (
-                "Para avanzar, necesito que me confirmes si querés seguir con esta transacción."
-            )
+            reminder_text = msg(lang, "reminder_confirm_transaction")
             _append_transcript_entry(session_id, "agent", reminder_text)
             for chunk in _chunk_text_for_sse(reminder_text):
                 yield {"event": "token", "data": {"text": chunk}}
             yield {
                 "event": "quick_replies",
-                "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+                "data": _build_quick_reply_payload(continue_choices(lang), "continue_confirmation"),
             }
 
         try:
@@ -1211,20 +1164,18 @@ async def run_agent_turn(session_id: str, user_message: str):
         if _looks_like_continue_confirmation(user_message):
             state["awaiting_cost_warning_confirmation"] = False
             state["awaiting_optional_info"] = True
-            optional_info_text = OPTIONAL_INFO_PROMPT_TEXT
+            optional_info_text = msg(lang, "optional_info_prompt_text")
             _append_transcript_entry(session_id, "agent", optional_info_text)
             for chunk in _chunk_text_for_sse(optional_info_text):
                 yield {"event": "token", "data": {"text": chunk}}
         else:
-            reminder_text = (
-                "Para seguir, confirmame si querés continuar o preferís cancelar."
-            )
+            reminder_text = msg(lang, "reminder_continue_or_cancel")
             _append_transcript_entry(session_id, "agent", reminder_text)
             for chunk in _chunk_text_for_sse(reminder_text):
                 yield {"event": "token", "data": {"text": chunk}}
             yield {
                 "event": "quick_replies",
-                "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+                "data": _build_quick_reply_payload(continue_choices(lang), "continue_confirmation"),
             }
 
         try:
@@ -1239,7 +1190,7 @@ async def run_agent_turn(session_id: str, user_message: str):
         state["awaiting_optional_info"] = False
         create_ticket_args: dict[str, Any] = {
             "reason_code": "unknown_transaction",
-            "reason_label_es": "Desconocimiento de transacciones",
+            "reason_label_es": CANONICAL_REASON_LABEL_ES,
             "user_additional_info": _extract_additional_info(user_message),
         }
         if state.get("transaction_id"):
@@ -1271,9 +1222,9 @@ async def run_agent_turn(session_id: str, user_message: str):
             "event": "tool_result",
             "data": {"name": "create_chargeback_ticket", "result": create_ticket_result},
         }
-        _schedule_rules_summary_from_tool_result(create_ticket_result)
+        _schedule_rules_summary_from_tool_result(create_ticket_result, lang)
 
-        final_text = _build_ticket_confirmation_text(create_ticket_result)
+        final_text = _build_ticket_confirmation_text(create_ticket_result, lang)
         _append_transcript_entry(session_id, "agent", final_text)
         for chunk in _chunk_text_for_sse(final_text):
             yield {"event": "token", "data": {"text": chunk}}
@@ -1289,10 +1240,7 @@ async def run_agent_turn(session_id: str, user_message: str):
     selected_transaction_id = _extract_selected_transaction_id(user_message)
     if selected_transaction_id:
         if not _is_latest_search_candidate(state, selected_transaction_id):
-            stale_selection_text = (
-                "No pude validar esa opción con la última búsqueda. "
-                "¿Querés que volvamos a buscar el cargo con fecha y monto?"
-            )
+            stale_selection_text = msg(lang, "stale_selection")
             _append_transcript_entry(session_id, "agent", stale_selection_text)
             for chunk in _chunk_text_for_sse(stale_selection_text):
                 yield {"event": "token", "data": {"text": chunk}}
@@ -1335,10 +1283,7 @@ async def run_agent_turn(session_id: str, user_message: str):
         payload = context_result.get("result")
         transaction = payload.get("transaction") if isinstance(payload, dict) else None
         if not isinstance(transaction, dict):
-            invalid_context_text = (
-                "No pude recuperar el contexto de esa transacción. "
-                "¿Me compartís otro dato del cargo para volver a buscar?"
-            )
+            invalid_context_text = msg(lang, "invalid_context_after_selection")
             state["awaiting_transaction_confirmation"] = False
             state["awaiting_cost_warning_confirmation"] = False
             state["awaiting_optional_info"] = False
@@ -1353,13 +1298,13 @@ async def run_agent_turn(session_id: str, user_message: str):
             yield {"event": "done", "data": {}}
             return
 
-        deterministic_confirmation = _build_transaction_confirmation_text(context_result)
+        deterministic_confirmation = _build_transaction_confirmation_text(context_result, lang)
         state["awaiting_transaction_confirmation"] = True
         state["awaiting_cost_warning_confirmation"] = False
         state["awaiting_optional_info"] = False
         yield {
             "event": "quick_replies",
-            "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+            "data": _build_quick_reply_payload(continue_choices(lang), "continue_confirmation"),
         }
         _append_transcript_entry(session_id, "agent", deterministic_confirmation)
         for chunk in _chunk_text_for_sse(deterministic_confirmation):
@@ -1409,8 +1354,8 @@ async def run_agent_turn(session_id: str, user_message: str):
             "event": "tool_result",
             "data": {"name": "search_transactions", "result": search_result},
         }
-        transaction_choices = _build_transaction_quick_replies(search_result)
-        deterministic_search_text = _build_transaction_selection_text(search_result)
+        transaction_choices = _build_transaction_quick_replies(search_result, lang)
+        deterministic_search_text = _build_transaction_selection_text(search_result, lang)
         if transaction_choices:
             yield {
                 "event": "quick_replies",
@@ -1469,19 +1414,16 @@ async def run_agent_turn(session_id: str, user_message: str):
             if _response_mentions_reason_menu(response_text):
                 yield {
                     "event": "quick_replies",
-                    "data": _build_quick_reply_payload(REASON_CHOICES, "reason_selection"),
+                    "data": _build_quick_reply_payload(reason_choices(lang), "reason_selection"),
                 }
-            if _response_requests_continue_confirmation(response_text):
+            if _response_requests_continue_confirmation(response_text, lang):
                 yield {
                     "event": "quick_replies",
-                    "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+                    "data": _build_quick_reply_payload(continue_choices(lang), "continue_confirmation"),
                 }
 
             if not response_text and finish_reason_name == "MALFORMED_FUNCTION_CALL":
-                response_text = (
-                    "Tuve un inconveniente técnico para procesar este paso. "
-                    "¿Podés escribir 'continuar' y lo intento de nuevo?"
-                )
+                response_text = msg(lang, "malformed_function_call")
                 _append_transcript_entry(session_id, "agent", response_text)
                 for chunk in _chunk_text_for_sse(response_text):
                     yield {"event": "token", "data": {"text": chunk}}
@@ -1503,10 +1445,7 @@ async def run_agent_turn(session_id: str, user_message: str):
                         "event": "tool_result",
                         "data": {"name": tool_name, "result": blocked_context_result},
                     }
-                    deterministic_turn_text = (
-                        "Necesito que selecciones una transacción de la última búsqueda para continuar. "
-                        "Si no la ves, pasame otro dato y la busco de nuevo."
-                    )
+                    deterministic_turn_text = msg(lang, "blocked_context_tool")
                     state["awaiting_transaction_confirmation"] = False
                     state["awaiting_cost_warning_confirmation"] = False
                     state["awaiting_optional_info"] = False
@@ -1529,10 +1468,10 @@ async def run_agent_turn(session_id: str, user_message: str):
                 "data": {"name": tool_name, "result": tool_result},
             }
             if tool_name == "create_chargeback_ticket":
-                _schedule_rules_summary_from_tool_result(tool_result)
+                _schedule_rules_summary_from_tool_result(tool_result, lang)
             if tool_name == "search_transactions":
-                transaction_choices = _build_transaction_quick_replies(tool_result)
-                deterministic_turn_text = _build_transaction_selection_text(tool_result)
+                transaction_choices = _build_transaction_quick_replies(tool_result, lang)
+                deterministic_turn_text = _build_transaction_selection_text(tool_result, lang)
                 state["awaiting_transaction_confirmation"] = False
                 state["awaiting_cost_warning_confirmation"] = False
                 state["awaiting_optional_info"] = False
@@ -1550,19 +1489,16 @@ async def run_agent_turn(session_id: str, user_message: str):
                 payload = tool_result.get("result")
                 transaction = payload.get("transaction") if isinstance(payload, dict) else None
                 if isinstance(transaction, dict):
-                    deterministic_turn_text = _build_transaction_confirmation_text(tool_result)
+                    deterministic_turn_text = _build_transaction_confirmation_text(tool_result, lang)
                     state["awaiting_transaction_confirmation"] = True
                     state["awaiting_cost_warning_confirmation"] = False
                     state["awaiting_optional_info"] = False
                     yield {
                         "event": "quick_replies",
-                        "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+                        "data": _build_quick_reply_payload(continue_choices(lang), "continue_confirmation"),
                     }
                 else:
-                    deterministic_turn_text = (
-                        "No encontré una transacción válida para ese contexto. "
-                        "¿Me compartís otro dato del cargo para volver a buscar?"
-                    )
+                    deterministic_turn_text = msg(lang, "invalid_context_tool_result")
                     state["awaiting_transaction_confirmation"] = False
                     state["awaiting_cost_warning_confirmation"] = False
                     state["awaiting_optional_info"] = False
@@ -1582,12 +1518,12 @@ async def run_agent_turn(session_id: str, user_message: str):
             if _response_mentions_reason_menu(response_text):
                 yield {
                     "event": "quick_replies",
-                    "data": _build_quick_reply_payload(REASON_CHOICES, "reason_selection"),
+                    "data": _build_quick_reply_payload(reason_choices(lang), "reason_selection"),
                 }
-            if _response_requests_continue_confirmation(response_text):
+            if _response_requests_continue_confirmation(response_text, lang):
                 yield {
                     "event": "quick_replies",
-                    "data": _build_quick_reply_payload(CONTINUE_CHOICES, "continue_confirmation"),
+                    "data": _build_quick_reply_payload(continue_choices(lang), "continue_confirmation"),
                 }
 
         response_text = final_response_text
@@ -1608,25 +1544,26 @@ def run_agent_loop_console() -> None:
     _ensure_runtime_ready()
     console_session_id = "__console__"
     reset_session(console_session_id)
+    console_lang = normalize_language(os.getenv("AGENT_CONSOLE_LANGUAGE", "es"))
 
-    print("Agente: Hola, soy el asistente de BROU. ¿En qué te puedo ayudar?")
-    print("Escribí 'salir' para terminar.")
+    print(msg(console_lang, "repl_greeting"))
+    print(msg(console_lang, "repl_exit_hint"))
 
     while True:
         try:
-            user_text = input("Vos: ").strip()
+            user_text = input(f"{msg(console_lang, 'repl_you')}: ").strip()
         except EOFError:
-            print("\nAgente: Gracias por contactarte. Quedo a las órdenes.")
+            print(f"\n{msg(console_lang, 'repl_goodbye')}")
             break
         if user_text.lower() in {"salir", "exit", "quit"}:
-            print("Agente: Gracias por contactarte. Quedo a las órdenes.")
+            print(msg(console_lang, "repl_goodbye"))
             break
         if not user_text:
             continue
 
         async def _consume_turn() -> None:
             text_chunks: list[str] = []
-            async for event in run_agent_turn(console_session_id, user_text):
+            async for event in run_agent_turn(console_session_id, user_text, language=console_lang):
                 if event["event"] == "token":
                     text_chunks.append(event["data"]["text"])
                 elif event["event"] == "tool_call":
@@ -1634,7 +1571,8 @@ def run_agent_loop_console() -> None:
                 elif event["event"] == "done":
                     text = "".join(text_chunks).strip()
                     if text:
-                        print(f"Agente: {text}")
+                        prefix = "Agente" if console_lang == "es" else "Agent"
+                        print(f"{prefix}: {text}")
 
             return None
 

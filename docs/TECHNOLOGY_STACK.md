@@ -1,6 +1,6 @@
 # Technology Stack (Living Reference)
 
-Last updated: 2026-05-08
+Last updated: 2026-06-09
 
 ## Application layers
 
@@ -9,6 +9,7 @@ Last updated: 2026-05-08
 - Database/API: Supabase (Postgres + PostgREST Python client).
 - LLM: Google Gemini via `google-genai` `1.18.0`.
 - Observability: Langfuse `2.60.5` (optional).
+- Localization: custom frontend language context/dictionaries (`frontend/lib/i18n.tsx`) + backend localized copy/prompt module (`backend/copy.py`) for ES/EN runtime switching.
 
 ## Backend Python dependencies
 
@@ -41,6 +42,11 @@ Defined in `frontend/package.json`:
 - Backend host/CORS: `BACKEND_HOST`, `BACKEND_PORT`, `FRONTEND_ORIGIN`
 - Frontend API URL: `NEXT_PUBLIC_BACKEND_URL`
 - Langfuse (optional): `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`
+
+## API localization contract
+
+- `POST /chat/stream`: accepts `session_id`, `message`, and optional `language` (`es` or `en`, default `es`).
+- `POST /chat/reset`: accepts `session_id` and optional `language` (`es` or `en`, default `es`).
 
 ## Update policy for this file
 
